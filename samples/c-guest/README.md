@@ -67,7 +67,7 @@ with `CARGO_BUILD_JOBS=1 make -C samples/c-guest` if needed.
 ## Native Rust subprocess
 
 The same unmodified C guest can be statically linked into a normal Rust
-executable using the workspace's [native runner](../../crates/hl-native-runner/).
+executable using the workspace's [hyperlight-process](../../crates/hyperlight-process/).
 The parent uses Vercode IPC and services `HostLog` over the subprocess pipes:
 
 ```sh
@@ -107,7 +107,7 @@ make -C samples/c-guest test-vm
 make -C samples/c-guest test-native
 
 # Adapter and wire-format tests plus native C subprocess integration.
-CARGO_BUILD_JOBS=1 cargo test -p hl-native-runner -p hyperlight-c-guest-native --locked
+CARGO_BUILD_JOBS=1 cargo test -p hyperlight-process -p hyperlight-c-guest-native --locked
 ```
 
 The native tests exercise registration, the callback and return-value types,

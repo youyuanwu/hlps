@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use hl_native_runner::RunnerBuilder;
+use hyperlight_process::RunnerBuilder;
 
 fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);

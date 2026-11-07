@@ -9,5 +9,5 @@ fn main() -> Result<()> {
         std::env::args_os().len() == 1,
         "usage: hyperlight-c-guest-native-runner"
     );
-    unsafe { hl_native_runner::runtime::run(hyperlight_main) }
+    unsafe { hyperlight_process::runtime::run(hyperlight_main) }
 }

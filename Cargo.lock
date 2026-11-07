@@ -469,16 +469,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hl-native-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "hyperlight-common",
- "libc",
- "vercode",
-]
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -501,7 +491,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
- "hl-native-runner",
+ "hyperlight-process",
 ]
 
 [[package]]
@@ -568,6 +558,16 @@ dependencies = [
  "windows-result",
  "windows-sys",
  "windows-version",
+]
+
+[[package]]
+name = "hyperlight-process"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hyperlight-common",
+ "libc",
+ "vercode",
 ]
 
 [[package]]

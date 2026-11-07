@@ -2,8 +2,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use hl_native_runner::protocol::{CallError, CallResult, FunctionCall, Value, ValueType};
-use hl_native_runner::{Runner, RunnerBuilder};
+use hyperlight_process::protocol::{CallError, CallResult, FunctionCall, Value, ValueType};
+use hyperlight_process::{Runner, RunnerBuilder};
 
 fn spawn() -> Result<Runner> {
     Runner::spawn(&mut Command::new(env!(
@@ -154,7 +154,7 @@ fn invalid_calls_and_host_errors_are_not_successes() -> Result<()> {
 
 #[test]
 fn missing_runner_is_reported() {
-    assert!(Runner::spawn(&mut Command::new("/nonexistent/hl-native-runner")).is_err());
+    assert!(Runner::spawn(&mut Command::new("/nonexistent/hyperlight-process")).is_err());
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn duplicate_host_registration_uses_the_last_callback() -> Result<()> {
 #[test]
 fn invalid_builder_names_fail_before_spawning() {
     for name in ["", "bad\0name"] {
-        let result = RunnerBuilder::from_executable("/nonexistent/hl-native-runner")
+        let result = RunnerBuilder::from_executable("/nonexistent/hyperlight-process")
             .host_function(name, || true)
             .build();
         assert!(
