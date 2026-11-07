@@ -1,0 +1,13 @@
+[package]
+name = "hl-native-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+hyperlight-common.workspace = true
+vercode.workspace = true
