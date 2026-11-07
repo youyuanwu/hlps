@@ -5,6 +5,8 @@ CC := clang
 CARGO ?= cargo
 CARGO_BUILD_JOBS ?= 2
 export CARGO_BUILD_JOBS
+WORKSPACE := $(abspath ../..)
+TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(abspath $(CARGO_TARGET_DIR)),$(WORKSPACE)/target)
 
 SDK_URL := https://github.com/hyperlight-dev/hyperlight/releases/download/v0.19.0
 LIB_SHA256 := f9925f4836aafcdd1aafdc618023d806a76f18e0eb74bfb9d11d985af26fd2d7
@@ -17,7 +19,7 @@ GUEST_CFLAGS := --target=x86_64-unknown-linux-none -U__linux__ \
 GUEST_LDFLAGS := -fuse-ld=lld -nostdlib -pie -Wl,-e,entrypoint \
 	-Wl,--no-dynamic-linker
 
-.PHONY: all guest host run test test-vm clean
+.PHONY: all guest host run native run-native test test-vm test-native clean
 all: guest host
 
 sdk/library.tar.gz:
@@ -48,7 +50,13 @@ host:
 	$(CARGO) build --locked --manifest-path host/Cargo.toml
 
 run: all
-	host/target/debug/hyperlight-c-guest-demo "$(CURDIR)/build/guest"
+	"$(TARGET_DIR)/debug/hyperlight-c-guest-demo" "$(CURDIR)/build/guest"
+
+native: build/native-include/.ready
+	$(CARGO) build --locked --manifest-path native/Cargo.toml --bins
+
+run-native: native
+	"$(TARGET_DIR)/debug/hyperlight-c-guest-native-demo"
 
 build/native-include/.ready: sdk/.ready
 	mkdir -p build/native-include
@@ -66,6 +74,9 @@ test: build/guest-test
 test-vm: guest
 	$(CARGO) test --locked --manifest-path host/Cargo.toml -- --ignored
 
+test-native: build/native-include/.ready
+	$(CARGO) test --locked --manifest-path native/Cargo.toml
+
 clean:
 	rm -f build/guest build/guest-test
-	$(CARGO) clean --manifest-path host/Cargo.toml
+	$(CARGO) clean --manifest-path "$(WORKSPACE)/Cargo.toml"

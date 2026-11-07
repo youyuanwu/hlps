@@ -1,0 +1,24 @@
+[package]
+name = "hyperlight-c-guest-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+default-run = "hyperlight-c-guest-native-demo"
+
+[dependencies]
+anyhow.workspace = true
+hl-native-runner.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+cc = "1"
+
+[[bin]]
+name = "hyperlight-c-guest-native-demo"
+path = "src/main.rs"
+
+[[bin]]
+name = "hyperlight-c-guest-native-runner"
+path = "src/bin/runner.rs"

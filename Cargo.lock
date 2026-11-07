@@ -469,6 +469,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hl-native-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hyperlight-common",
+ "libc",
+ "vercode",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,6 +493,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hyperlight-host",
+]
+
+[[package]]
+name = "hyperlight-c-guest-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "hl-native-runner",
 ]
 
 [[package]]
@@ -1261,6 +1280,27 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vercode"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16cce307cfc082bfe34c9ed07f97a155dbcfd5231482add1efc3f8a123d74efa"
+dependencies = [
+ "uuid",
+ "vercode-macros",
+]
+
+[[package]]
+name = "vercode-macros"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8d27074e6600693acd2af8797f9de2ad97aec7b84f48821c84ae970e1555257"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "vmm-sys-util"

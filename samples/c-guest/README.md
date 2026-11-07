@@ -25,6 +25,9 @@ host's libc.
 
 - Internet access for the initial SDK and Cargo dependency downloads.
 
+The native subprocess mode below requires Linux x86_64 and the build tools,
+but does not require KVM or elevated permissions.
+
 The host and guest are pinned to **Hyperlight 0.19.0**. Hyperlight checks the
 guest's embedded version, so both must be upgraded together. The Makefile
 downloads the released C headers and static runtime library, verifies their
@@ -54,12 +57,42 @@ ordinary and wide integer addition. Its only optional argument is the guest
 ELF path; without one it loads this sample's `build/guest`.
 
 ```sh
-samples/c-guest/host/target/debug/hyperlight-c-guest-demo \
+target/debug/hyperlight-c-guest-demo \
   samples/c-guest/build/guest
 ```
 
 Cargo builds default to two concurrent jobs to limit memory usage; override
 with `CARGO_BUILD_JOBS=1 make -C samples/c-guest` if needed.
+
+## Native Rust subprocess
+
+The same unmodified C guest can be statically linked into a normal Rust
+executable using the workspace's [native runner](../../crates/hl-native-runner/).
+The parent uses Vercode IPC and services `HostLog` over the subprocess pipes:
+
+```sh
+CARGO_BUILD_JOBS=1 make -C samples/c-guest run-native
+```
+
+Expected output is the same greeting and `Add(20, 22) = 42`, followed by
+`All native subprocess guest checks passed.` No sudo or KVM is needed.
+
+The [native sample](native/) builds both the runner and the parent executable.
+Its parent uses `RunnerBuilder::host_function` and typed
+`runner.call::<String>("Greet", name)` / `runner.call::<i64>("Add", (left, right))`,
+matching the KVM sandbox's calling conventions without changing the C guest.
+The runner accepts binary IPC on stdin/stdout, not interactive commands. To
+choose a different runner executable, pass its path to the parent demo:
+
+```sh
+target/debug/hyperlight-c-guest-native-demo \
+  target/debug/hyperlight-c-guest-native-runner
+```
+
+This is explicit native execution, **not a fallback or equivalent isolation**
+for the micro-VM. Only use trusted guests. Changing the statically linked guest
+requires rebuilding its executable; the adapter itself is function-generic.
+All workspace packages share the root Cargo lockfile and `target/` directory.
 
 ## Tests
 
@@ -69,6 +102,12 @@ make -C samples/c-guest test
 
 # Actual C guest/host round trip in KVM.
 make -C samples/c-guest test-vm
+
+# Actual native Rust subprocess, registration, IPC, callbacks, and errors.
+make -C samples/c-guest test-native
+
+# Adapter and wire-format tests plus native C subprocess integration.
+CARGO_BUILD_JOBS=1 cargo test -p hl-native-runner -p hyperlight-c-guest-native --locked
 ```
 
 The native tests exercise registration, the callback and return-value types,
