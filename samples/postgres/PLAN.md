@@ -1,8 +1,8 @@
 # PostgreSQL on Hyperlight-Unikraft: experiment plan
 
-Status: **Phases 1 and 2 implemented and validated; PostgreSQL 16.15 runs as a
-RAM-only server**. See [instructions and results](README.md). Persistent storage
-and recovery remain unimplemented.
+Status: **Phases 1-3 implemented and validated within their documented scope**.
+See [instructions and results](README.md). Crash recovery,
+spilling, and power-loss durability are not yet established.
 Prepared 2026-11-08.
 
 ## Objective
@@ -97,9 +97,9 @@ Important differences:
 
 ## Proposed repository layout
 
-Phases 1 and 2 implement source pins, baseline/process probes, PostgreSQL
-patches/packaging, and the concurrent SQL gate. Persistent-storage, spill,
-and recovery tests below remain future work.
+Phases 1-3 implement source pins, process probes, PostgreSQL patches/packaging,
+the concurrent SQL gate, and the host-backed synchronization boundary.
+Spill/crash-recovery tests and broader descriptor compatibility remain work.
 
 ```text
 samples/postgres/
@@ -250,6 +250,15 @@ include such a test before expanding catalog/file-count coverage.
 **Gate:** synchronization is observed at the host boundary with `fsync` enabled,
 file and directory errors are surfaced, a second writer is rejected, and
 PostgreSQL starts against host-backed data without relying on silent no-ops.
+
+2026-11-08: this targeted gate passes with real OS file/directory barriers,
+observed PostgreSQL WAL/checkpoint synchronization, explicit sync/write/quota/
+read-only errors, 5,000-entry pagination, inode-based single-writer guards
+held by the VM host, and clean PostgreSQL shutdown. Earlier profiles still
+pass. The host runs at the invoking user's uid/gid with process-local KVM
+group access; strict budget scans surface permission failures. Full unlinked/
+renamed-open descriptor semantics and guest record locks remain unsupported
+and explicitly documented. See [measured results and limits](README.md).
 
 ## Phase 4: spill, transactions, and restart validation
 

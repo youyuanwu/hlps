@@ -148,8 +148,11 @@ int main(int argc, char **argv)
         return 0;
     }
     shared_creator_probe();
+    const char *data = getenv("HL_PG_DATA");
+    if (data == NULL)
+        data = "/pgdata";
     struct stat st;
-    if (stat("/pgdata", &st) != 0 || st.st_uid != geteuid() || st.st_gid != getegid()) {
+    if (stat(data, &st) != 0 || st.st_uid != geteuid() || st.st_gid != getegid()) {
         fprintf(stderr, "PG_INIT data directory ownership does not match guest identity\n");
         return 1;
     }
@@ -176,7 +179,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "PG_INIT control listener: %s\n", strerror(errno));
         return 1;
     }
-    char *args[] = {"/usr/local/bin/postgres", "-D", "/pgdata", NULL};
+    char *args[] = {"/usr/local/bin/postgres", "-D", (char *)data, NULL};
     int error = posix_spawn(&postmaster, args[0], NULL, NULL, args, environ);
     if (error) {
         fprintf(stderr, "PG_INIT spawn: %s\n", strerror(error));

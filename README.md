@@ -10,8 +10,8 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
 - [Three-mode benchmarks](samples/benchmark/README.md): shared C workloads,
   Criterion steady-state measurements, and lifecycle/per-call latency CSV.
 - [PostgreSQL experiment](samples/postgres/README.md): pinned Hyperlight-Unikraft
-  baseline and PostgreSQL 16.15 RAM-only SQL server; [the plan](samples/postgres/PLAN.md)
-  covers subsequent persistent storage, spill, and recovery validation.
+  baseline, PostgreSQL 16.15 server, and host-backed synchronization boundary;
+  [the plan](samples/postgres/PLAN.md) covers spill and recovery validation.
 
 ## Rust workspace
 

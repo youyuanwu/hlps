@@ -1,10 +1,11 @@
 # PostgreSQL experiment
 
-This directory implements the Phase 1 Hyperlight-Unikraft baseline/process
-probes and the Phase 2 PostgreSQL 16.15 RAM-only prototype from
+This directory implements the Hyperlight-Unikraft baseline/process probes,
+PostgreSQL 16.15 RAM-only prototype, and host-backed storage boundary from
 [the plan](PLAN.md). Phase 1 needs no network, host mounts, database files,
 or snapshots. Phase 2 uses authenticated loopback TCP and an initialized
-in-guest database; it is not a durable storage milestone.
+in-guest database. Phase 3 enables real host-backed synchronization; crash
+recovery and power-loss durability are not yet established.
 
 ## Phase 1: build and run
 
@@ -264,6 +265,129 @@ bypass initially explored during bring-up was removed, and both PostgreSQL's
 main/root-check source and data-directory ownership-check source are
 byte-identical to the verified native source.
 
-This is a functional, RAM-only prototype. **Phase 3 has not started**;
-host-backed storage, disk-spill validation, durable synchronization/recovery,
-and snapshots are not supported or claimed.
+Phase 2 alone is a functional, RAM-only prototype;
+disk-spill validation, crash recovery, and snapshots remain later work. Phase 3
+below supplies the initial host-backed storage/synchronization boundary.
+
+## Phase 3: host-backed storage boundary
+
+After the previous phases have built the native/guest PostgreSQL tools:
+
+```sh
+make -C samples/postgres storage-build storage-package storage-init
+make -C samples/postgres phase3
+```
+
+`storage-init` is deliberately one-time: it refuses to overwrite existing
+PGDATA. Subsequent `phase3` runs reuse the dedicated
+`target/postgres-experiment/phase3/storage/` directory. To update the managed
+test configuration independently use `make -C samples/postgres storage-config`.
+Configuration updates require exclusive ownership and reject a live/stale
+postmaster lockfile; they never initialize or erase an existing database.
+
+The [persistent profile](rootfs/persistent.conf) enables `fsync`,
+`synchronous_commit`, and `wal_sync_method=fsync`. It keeps the bounded
+connections/memory/WAL/temp settings of the earlier prototype. Optional
+writeback hints are disabled because the pinned kernel lacks `sync_file_range`;
+actual file/directory synchronization is not disabled. PGDATA, WAL, temp
+files, and DSM descriptors live only below this experiment's host directory.
+The application/kernel rootfs remains RAM-backed.
+
+The [host patch](patches/hyperlight-unikraft/README.md) wires an explicit
+`FsBackend::sync` through `fs_sync` to the real OS file's `sync_all`/`sync_data`.
+Unsupported backends return EOPNOTSUPP, not success. The
+[kernel patch](patches/unikraft/README.md) forwards VFS `fsync`; its legacy
+`fdatasync`, O_SYNC, and O_DSYNC paths use full fsync, a stronger barrier.
+Hostfs create/mkdir permissions and stat ownership reach the real filesystem.
+Paginated listings retain at most 128 entries per host page and bounded
+per-open guest page state instead of re-sending the entire directory.
+
+[storage-host.rs](storage-host.rs) is a small instrumented host using the
+existing Hyperlight-Unikraft library/API, not a new VMM or runtime. It opens a
+capability-confined directory backend, records sync/error results, enforces a
+512 MiB logical-file-size budget, and exposes only `/storage` plus a read-only
+view for testing. It uses the same loopback PostgreSQL/control ports and
+fresh-VM control identity as Phase 2. No outbound networking or snapshots.
+
+Both configuration/initialization and the running VM host take an exclusive
+lock on the storage directory **inode**, rejecting aliases and second writers.
+The VM host retains its own lock until guest teardown, even if its launcher
+exits. Directly running an unguarded native PostgreSQL or modifying the storage
+directory from unrelated host tools is prohibited by the experiment workflow;
+an advisory lock is not a defense against noncooperating host programs.
+
+The persistent host runs as the invoking user's uid/gid. When direct KVM
+access is unavailable, `sudo -n setpriv` drops root before launching it and
+supplies the existing KVM group only to that process. Device permissions and
+system user/group membership are not changed. This keeps new database files
+owned by the experiment user. Budget scans fail explicitly on unreadable
+directories, rather than skipping them.
+
+The gate runs [storage probes](tests/storage.c) before PostgreSQL:
+
+- Exact offsets, readbacks, truncate, append file position, chmod, mkdir modes,
+  O_EXCL collision, and rename followed by reopen.
+- Actual file/directory synchronization and O_SYNC/O_DSYNC barriers.
+- Injected EIO on file/directory sync and synchronous write; partial write
+  followed by EIO with exact surviving bytes; EDQUOT on an oversized write.
+- Read-only write rejection and explicit refusal of unsupported hostfs
+  record locks/flock, rather than the kernel's previous success stubs.
+- All 5,000 directory entries in order, multiple transport pages, and rewind.
+- PostgreSQL startup with synchronization enabled, a committed row, checkpoint,
+  required auxiliary processes, and graceful shutdown.
+- Concurrent writer rejection by both the Python guard and another actual VM
+  host, before it opens the writable backend.
+
+Each VM has a 120-second host deadline, readiness/SQL/shutdown have their own
+deadlines, builds use one job, and tests run serially. The managed probe files
+are the only files test setup resets; PostgreSQL data is not erased.
+Rebuilding rootfs images never copies live PGDATA into them.
+
+Generated metadata, `probes.log`, `guest.log`, and JSONL operation audits remain
+under the ignored Phase 3 artifact directory. A successful audit entry is
+written only after the actual sync API returns successfully; failure entries
+record the propagated error. The gate requires WAL and directory sync evidence,
+not just `SHOW fsync` output or a successful SQL response.
+
+### Limits
+
+This is an initial persistent-storage **boundary**, not a production/durability
+certification. The protocol remains path-based: correct OS-file-description
+semantics for open files that are unlinked/renamed, arbitrary seekdir cookies,
+and full guest record locking are not implemented. Tested PostgreSQL accesses
+use stable paths or close/reopen across renames, with exclusive whole-directory
+ownership. Hostfs mount-wide sync is explicitly unsupported; callers must
+sync the relevant file and directory descriptors.
+
+Injected failures model write/sync/quota errors at the host boundary, not loss
+of the host page cache, machine power failure, or every physical filesystem
+fault. No host reboot or global cache manipulation is performed. Crash
+recovery, acknowledged-commit fault tests, stale DSM cleanup after crashes,
+measured spilling, and broader filesystem/descriptor compatibility belong to
+Phase 4 or follow-ups; snapshots remain forbidden.
+
+### Phase 3 results (2026-11-08)
+
+**Targeted storage-boundary gate passed**, including repeat runs after switching
+back to the earlier kernel profiles.
+
+| Check | Observed result |
+|-------|-----------------|
+| PostgreSQL profile | 16.15, `fsync=on`, `synchronous_commit=on`, WAL method `fsync` |
+| Real OS synchronization | 60 successful calls in the final SQL/checkpoint/shutdown run |
+| Synchronized directories | Logical, transaction, commit-timestamp, and multixact directories |
+| Storage errors | File/directory/synchronous-write EIO, partial-write EIO, EDQUOT, EROFS surfaced |
+| Directory listing | 5,000 exact entries over bounded pages; rewind passes |
+| Ownership | Second Python guard and actual competing VM host rejected |
+| Data budget | 39,494,900 logical bytes, including PGDATA/WAL and probes; below 512 MiB |
+| Shutdown | Committed query/checkpoint succeeds; guest exits 0; host lock released |
+| Regressions | 9 native + 9 KVM Phase 1 probes; Phase 2 concurrent SQL/reconnect gate |
+| Validation | 16 Python tests, 5 targeted Rust tests, Clippy with warnings denied |
+
+The final persistent host runs as uid/gid 1000 rather than root. Generated
+database files remain readable/manageable by the invoking user, and strict
+disk scans do not skip inaccessible subdirectories.
+
+This passes Phase 3's limited gate, not Phase 4's spill/crash-recovery/durability
+gate. The path-based descriptor and advisory-lock limitations above remain
+explicit follow-ups.

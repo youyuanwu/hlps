@@ -129,7 +129,13 @@ def build_postgres(guest):
 
 
 def bytes_in(path):
-    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+    def fail(error):
+        raise error
+    total = 0
+    for directory, _, files in os.walk(path, onerror=fail, followlinks=False):
+        for name in files:
+            total += (Path(directory) / name).lstat().st_size
+    return total
 
 
 def inputs():
@@ -242,8 +248,8 @@ def package():
 
 
 class Session:
-    def __init__(self, name, env):
-        self.log = (DATA / f"psql-{name}.log").open("wb")
+    def __init__(self, name, env, log_dir=DATA):
+        self.log = (log_dir / f"psql-{name}.log").open("wb")
         self.process = subprocess.Popen(
             [str(NATIVE / "bin/psql"), "-X", "-qAt", "-F", "|",
              "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-p", str(PORT),

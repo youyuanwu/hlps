@@ -61,3 +61,36 @@ anonymous shared mapping, reaps it, checks the surviving bytes, shrinks and
 regrows the mapping, and explicitly unmaps it. The full SQL gate checks
 statistics use, backend exit/reconnect, graceful teardown, and bounded RSS
 growth. Ordinary Phase 1 process/TLS/shared-memory probes also run.
+
+## 0004: hostfs synchronization, ownership, pagination and close semantics
+
+Locally authored; retains the affected BSD notices. Not submitted upstream.
+Paired with [the host patch](../hyperlight-unikraft/README.md).
+
+Replace hostfs's successful fsync stub with an explicit host call. The legacy
+VFS fdatasync path uses this same full fsync, which is a stronger durability
+barrier rather than a no-op. Synchronous writes (O_SYNC/O_DSYNC) also execute
+the full barrier before returning.
+
+Hostfs has no guest write cache: mark its vnodes to avoid VFS's implicit
+fsync-on-close, which would turn closing read-only or removed files into
+unrequested path-based syncs. Explicit sync errors propagate. Ensure close
+still unlocks/releases resources after errors for other filesystems.
+
+Set create/mkdir modes on the host, report uid/gid from the single stat reply,
+and make append file position track the actual end. Add bounded per-open
+directory page state and support rewind without relisting the whole directory
+on every entry. Reject malformed or unsupported backend page replies.
+
+The hostfs protocol is still path-based, not an OS file-description protocol.
+Closing and reopening files across renames is tested; POSIX semantics for
+unlinked-open files and arbitrary seekdir cookies are not implemented here.
+Unsupported hostfs record locks fail EOPNOTSUPP instead of silently reporting
+success. PostgreSQL's data-directory O_EXCL interlock remains intact, and an
+additional host inode lock exclusively owns all writable storage during a VM.
+
+Tests: native helper/audit tests; KVM offsets/truncate/append/modes/rename,
+O_SYNC/O_DSYNC barriers, file/directory sync errors, partial writes, quota,
+read-only rejection, record-lock refusal, and 5,000 entries plus rewind.
+PostgreSQL runs with fsync and synchronous_commit enabled and observed WAL,
+relation, and directory OS synchronization. Previous guest profiles also run.
