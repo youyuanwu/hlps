@@ -140,28 +140,30 @@ def patch_files(name):
 
 def prepare_patches():
     for name, relative in PATCH_TARGETS.items():
-        path = UPSTREAM / relative
-        files = patch_files(name)
-        expected = [{"name": p.name, "sha256": digest(p)} for p in files]
-        stamp = WORK / f"{name}-patches.json"
-        diff = run(["git", "diff", "--ignore-submodules=dirty", "--binary", "HEAD", "--", ".",
-                    ":!kernel/elfloader_hyperlight-x86_64"],
-                   cwd=path, capture=True)
-        previous = json.loads(stamp.read_text()) if stamp.exists() else None
-        current_diff = hashlib.sha256(diff.encode()).hexdigest()
-        if previous and previous == {"patches": expected, "diff": current_diff}:
-            continue
-        if diff:
-            raise RuntimeError(f"{name}: checkout has unexpected changes; "
-                               "use a new clean pinned checkout, do not discard edits")
-        for patch in files:
-            run(["git", "apply", "--check", patch], cwd=path)
-            run(["git", "apply", patch], cwd=path)
-        diff = run(["git", "diff", "--ignore-submodules=dirty", "--binary", "HEAD", "--", ".",
-                    ":!kernel/elfloader_hyperlight-x86_64"],
-                   cwd=path, capture=True)
-        write_json(stamp, {"patches": expected,
-                          "diff": hashlib.sha256(diff.encode()).hexdigest()})
+        prepare_patch_target(name, UPSTREAM / relative,
+                             (":!kernel/elfloader_hyperlight-x86_64",))
+
+
+def prepare_patch_target(name, path, exclusions=()):
+    files = patch_files(name)
+    expected = [{"name": p.name, "sha256": digest(p)} for p in files]
+    stamp = WORK / f"{name}-patches.json"
+    command = ["git", "diff", "--ignore-submodules=dirty", "--binary", "HEAD",
+               "--", ".", *exclusions]
+    diff = run(command, cwd=path, capture=True)
+    previous = json.loads(stamp.read_text()) if stamp.exists() else None
+    current_diff = hashlib.sha256(diff.encode()).hexdigest()
+    if previous and previous == {"patches": expected, "diff": current_diff}:
+        return
+    if diff:
+        raise RuntimeError(f"{name}: checkout has unexpected changes; "
+                           "use a new clean pinned checkout, do not discard edits")
+    for patch in files:
+        run(["git", "apply", "--check", patch], cwd=path)
+        run(["git", "apply", patch], cwd=path)
+    diff = run(command, cwd=path, capture=True)
+    write_json(stamp, {"patches": expected,
+                      "diff": hashlib.sha256(diff.encode()).hexdigest()})
 
 
 def fetch():
@@ -203,7 +205,7 @@ def fetch():
     prepare_patches()
 
 
-def build():
+def build(overlay=None, output=WORK):
     verify_upstream()
     prepare_patches()
     kernel = UPSTREAM / "kernel"
@@ -212,35 +214,44 @@ def build():
                for name in PATCH_TARGETS}
     config_inputs = {"defconfig": digest(UPSTREAM / "defconfig-elfloader"),
                      "sources": pins(), "patches": patches}
-    stamp = WORK / "kernel-config.json"
+    contents = (UPSTREAM / "defconfig-elfloader").read_bytes()
+    if overlay is not None:
+        config_inputs["overlay"] = digest(overlay)
+        contents += b"\n" + overlay.read_bytes()
+    stamp = output / "kernel-config.json"
+    saved = json.loads(stamp.read_text()) if stamp.exists() else {}
     # Use the same Make inputs as upstream, but no privileged Docker build.
-    if not (app / ".config").exists() or not stamp.exists() or \
-            json.loads(stamp.read_text()) != config_inputs:
-        (app / ".config").write_bytes((UPSTREAM / "defconfig-elfloader").read_bytes())
+    if not (app / ".config").exists() or saved.get("inputs") != config_inputs or \
+            saved.get("config_sha256") != digest(app / ".config"):
+        (app / ".config").write_bytes(contents)
     args = ["make", "-j1", "-C", kernel / "unikraft", f"A={app}",
-            f"L={kernel / 'libs/libelf'}", f"O={WORK / 'kernel-build'}",
+            f"L={kernel / 'libs/libelf'}", f"O={output / 'kernel-build'}",
             "UK_CFLAGS=-std=gnu17 -march=x86-64"]
     kernel_inputs = dict(config_inputs, cflags=args[-1],
                          compiler=run(["gcc", "--version"], capture=True).splitlines()[0])
-    build_stamp = WORK / "kernel-build-inputs.json"
+    build_stamp = output / "kernel-build-inputs.json"
     run([*args, "olddefconfig"])
     if not build_stamp.exists() or json.loads(build_stamp.read_text()) != kernel_inputs:
         run([*args, "clean"])
         run([*args, "olddefconfig"])
-    write_json(stamp, config_inputs)
+    write_json(stamp, {"inputs": config_inputs, "config_sha256": digest(app / ".config")})
     run(args)
     write_json(build_stamp, kernel_inputs)
-    rebuilt = WORK / "kernel-build/elfloader_hyperlight-x86_64"
+    rebuilt = output / "kernel-build/elfloader_hyperlight-x86_64"
     embedded = kernel / "elfloader_hyperlight-x86_64"
     if digest(rebuilt) != digest(embedded):
         shutil.copyfile(rebuilt, embedded)
     env = dict(os.environ, CARGO_BUILD_JOBS="1",
                CARGO_TARGET_DIR=str(WORK / "cargo"), CARGO_PROFILE_DEV_DEBUG="0")
     run(["cargo", "build", "--locked", "--bin", "hluk"], cwd=UPSTREAM, env=env)
+    cli = WORK / "cargo/debug/hluk"
+    if overlay is not None:
+        shutil.copy2(cli, output / "hluk")
+        cli = output / "hluk"
     compile_probe()
     metadata = {"sources": pins(), "submodules": verify_upstream(), "inputs": build_inputs(),
                 "kernel_sha256": digest(rebuilt), "embedded_kernel_sha256": digest(embedded),
-                "cli_sha256": digest(WORK / "cargo/debug/hluk"),
+                "cli_sha256": digest(cli),
                 "rootfs_sha256": digest(WORK / "phase1.cpio"),
                 "config_sha256": digest(app / ".config"),
                 "kernel_cflags": "-std=gnu17 -march=x86-64", "build_jobs": 1,
@@ -249,7 +260,9 @@ def build():
                 "rustc": run(["rustc", "--version"], capture=True).strip(),
                 "compiler": run(["gcc", "--version"], capture=True).splitlines()[0],
                 "patches": patches}
-    write_json(WORK / "build.json", metadata)
+    if overlay is not None:
+        metadata["overlay_sha256"] = digest(overlay)
+    write_json(output / ("kernel.json" if overlay is not None else "build.json"), metadata)
 
 
 def compile_executable(destination):

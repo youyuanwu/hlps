@@ -1,11 +1,12 @@
-# PostgreSQL experiment: Phase 1
+# PostgreSQL experiment
 
-This directory implements the pinned Hyperlight-Unikraft baseline and process
-probes from [the plan](PLAN.md). It does **not** build or run PostgreSQL yet.
-No network access, host filesystem mounts, database files, or snapshots are
-needed by these probes.
+This directory implements the Phase 1 Hyperlight-Unikraft baseline/process
+probes and the Phase 2 PostgreSQL 16.15 RAM-only prototype from
+[the plan](PLAN.md). Phase 1 needs no network, host mounts, database files,
+or snapshots. Phase 2 uses authenticated loopback TCP and an initialized
+in-guest database; it is not a durable storage milestone.
 
-## Build and run
+## Phase 1: build and run
 
 First target: Linux x86_64 with KVM. Run builds as an ordinary user.
 
@@ -31,7 +32,7 @@ use `sudo -n`; builds never do. Device permissions are not changed.
 
 [sources.toml](sources.toml) pins the host, all three kernel submodules, the
 PostgreSQL archive/checksum, the BSDkrun reference, and Hyperlight 0.19.0.
-PostgreSQL is downloaded and checksum-verified but left unbuilt. BSDkrun is a
+Phase 1 downloads/checks PostgreSQL but does not build it. BSDkrun is a
 sparse, pinned local reference checkout, not a new remote fork or dependency.
 Licenses/notices stay with downloaded sources. Hyperlight-Unikraft is Apache
 2.0; Unikraft and libelf include BSD licenses and per-file notices; musl uses
@@ -145,5 +146,124 @@ must not be used to raise PostgreSQL's stack-depth setting.
 
 Remaining limitations include one cooperative vCPU, unsupported ordinary
 `fork`, and unsupported `SA_RESTART` in the base kernel. The probe retries
-interrupted I/O explicitly. PostgreSQL process adaptation and durable
-filesystem synchronization are still subsequent phases.
+interrupted I/O explicitly. Phase 2 below implements process adaptation;
+durable filesystem synchronization remains subsequent work.
+
+## Phase 2: PostgreSQL RAM-only prototype
+
+```sh
+make -C samples/postgres phase2
+```
+
+Selected steps, all serial:
+
+```sh
+make -C samples/postgres pg-kernel pg-native pg-guest pg-package
+make -C samples/postgres check pg-test
+```
+
+The initial native PostgreSQL build takes longer than a cached run. It uses
+unmodified verified 16.15 sources to provide matching initdb/client tools.
+The guest uses a separate source tree, an
+[ordered target-guarded patch stack](patches/postgres/README.md),
+`EXEC_BACKEND`, musl, GNU C17, baseline x86-64, and assertions. ICU, readline,
+compression libraries, and SSL are configured out. Only the guest server,
+timezone data, and builtin PL/pgSQL are built/packaged; no Docker is needed.
+Patch/configuration changes invalidate old objects before rebuilding.
+
+[rootfs/kernel.conf](rootfs/kernel.conf) selects uid/gid 1000 and the
+`phase2` guest identity. It overlays, rather than modifies, upstream's pinned
+defconfig. There is **no PostgreSQL root-check removal**. Native and guest
+data-directory ownership checks remain intact.
+
+The Phase 2 kernel and copied CLI are separate artifacts under
+`target/postgres-experiment/phase2/`. Kernel profiles reuse the one Cargo
+cache to save disk, but the Phase 2 CLI embeds its own rebuilt kernel and is
+copied before another profile can overwrite the cache binary. `make phase1`
+restores/rebuilds the original kernel profile; this does not change the copied
+Phase 2 CLI. Both profiles record the actual kernel/configuration checksums.
+
+The [RAM-only configuration](rootfs/ram-only.conf) sets:
+
+- 512 MiB scratch, two client connections, 16 MiB shared buffers, and
+  conservative 512 KiB maximum stack depth.
+- Anonymous main shared memory and VM-scoped DSM; no host filesystem mounts.
+- PostgreSQL on `127.0.0.1:55432`, with generated SCRAM-SHA-256 credentials.
+- Required startup/checkpointer/background-writer/WAL-writer processes;
+  no autovacuum, parallel workers, WAL senders, or logging collector.
+- `fsync=off`, bounded temp/WAL settings, and a 512 MiB database/WAL test budget.
+  This deliberately nonpersistent profile **cannot satisfy a durability gate**.
+
+[rootfs/init.c](rootfs/init.c) is an ordinary Linux PIE supervisor, not an
+interpreter driver or VMM. It spawns the postmaster and reaps it. A separate
+loopback-only control listener at `127.0.0.1:55433` accepts only the current
+VM's random identity before requesting PostgreSQL fast shutdown. Both ports
+are explicit capabilities; outbound networking is denied. The pinned CLI's
+stdin host callback blocks the host while reading, so this supervisor does
+not use stdin as a live control channel.
+
+`pg-test` boots fresh with `--cold`, holds the exclusive experiment lock,
+rejects occupied ports, and tests:
+
+1. Wrong-password rejection and two authenticated simultaneous, distinct
+   backends.
+2. Real auxiliary processes and exact PostgreSQL/profile settings.
+3. Table creation, inserts, committed visibility, rollback, and no dirty reads.
+4. Distinct application/timezone settings and same-named independent temp tables.
+5. Four warm-up plus 24 fresh connections without stale temp/settings state.
+6. At most 32 MiB additional host RSS after warm-up, and a bounded live
+   database/WAL footprint.
+7. Invalid control-identity rejection, graceful postmaster shutdown, and zero
+   guest exit status.
+
+Readiness, SQL, clients, shutdown, and the overall VM have bounded host
+deadlines; the VM deadline is 180 seconds. Timeout/error cleanup targets only
+this test's process tree. The finite RSS test detects large reconnect leaks,
+not all possible lifetime leaks.
+
+`pg-package` regenerates only the known generated rootfs/seed and credentials.
+Each run boots its own RAM copy; SQL changes are lost on VM exit. Unrecognized partial packaging directories are not silently overwritten.
+Credentials, sources, binaries, CPIOs, native/guest build caches, and live
+results stay ignored. Do not directly execute the guest-specific binary on
+Linux, reuse DSM descriptors across VMs, attach persistent PGDATA, or use
+snapshots with this prototype.
+
+Artifacts under `target/postgres-experiment/phase2/` include `kernel.json`,
+`build.json`, `guest.log`, `psql-*.log`, and `results.json`. Source/patch,
+configuration, native tool, kernel, CLI, and rootfs identities are checked
+before tests. The JSON status is the observed gate result, not an inference
+from a successful compile.
+
+### Phase 2 results (2026-11-08)
+
+**Gate passed**, including repeated fresh-VM runs and a run after restoring the
+original Phase 1 kernel profile.
+
+| Measurement/check | Result |
+|-------------------|--------|
+| PostgreSQL | 16.15; uid/gid 1000; root/ownership checks unchanged |
+| Simultaneous authenticated backends | 2 distinct sessions |
+| Transactions | Explicit commit and rollback in both sessions; no dirty reads |
+| Session isolation | Independent settings and same-named temp tables |
+| Reconnects | 4 warm-up + 24 checked connections |
+| Host RSS before / after reconnects | 183,544 / 183,544 KiB; no measured growth |
+| Database plus WAL | 38,805,557 bytes, below 512 MiB budget |
+| Shutdown | PostgreSQL fast shutdown and guest exit 0 |
+| Existing baseline | All 9 native and 9 KVM process probes pass |
+| Helper/native validation | 10 Python tests; native guard-off syntax checks with and without EXEC_BACKEND |
+
+Two additional [kernel fixes](patches/unikraft/README.md) were necessary beyond
+Phase 1's caught-signal patch: RAMFS nodes needed real stored single-user
+ownership, and shared anonymous DSM mappings needed to survive their creating
+process's exit. A creator-exit/remap/unmap probe and a new-file ownership probe
+pass before PostgreSQL starts. Private mappings still receive process/exec
+cleanup; the reconnect test remains bounded.
+
+Ordinary native PostgreSQL sources are unmodified. The guest-specific root
+bypass initially explored during bring-up was removed, and both PostgreSQL's
+main/root-check source and data-directory ownership-check source are
+byte-identical to the verified native source.
+
+This is a functional, RAM-only prototype. **Phase 3 has not started**;
+host-backed storage, disk-spill validation, durable synchronization/recovery,
+and snapshots are not supported or claimed.

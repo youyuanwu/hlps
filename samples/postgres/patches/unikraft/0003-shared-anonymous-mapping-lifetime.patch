@@ -1,0 +1,57 @@
+diff --git a/lib/posix-mmap/mmap.c b/lib/posix-mmap/mmap.c
+index 2a774db..a1aa475 100644
+--- a/lib/posix-mmap/mmap.c
++++ b/lib/posix-mmap/mmap.c
+@@ -78,6 +78,7 @@ static int do_mmap(void **addr, size_t len, int prot, int flags, int fd,
+ #endif /* CONFIG_LIBPOSIX_FDTAB */
+ 	void *vargs;
+ 	const struct uk_vma_ops *vops;
++	const void *owner = MMAP_OWNER();
+ 	unsigned int order, lvl = UK_PAGING_PAGE_LEVEL;
+ 	int rc;
+ 
+@@ -220,8 +221,13 @@ static int do_mmap(void **addr, size_t len, int prot, int flags, int fd,
+ 	/* MAP_NONBLOCKED: Ignored for now */
+ 	/* MAP_NORESERVE : Ignored for now */
+ 
++	/* Shared anonymous memory outlives its creating exec image. */
++	if ((flags & MAP_ANONYMOUS) && (flags & MAP_SHARED)) {
++		vflags |= UK_VMA_ANON_SHARED;
++		owner = NULL;
++	}
+ 	rc = uk_vma_map_owned(vas, &vaddr, len, vattr, vflags, NULL, vops,
+-			      vargs, MMAP_OWNER());
++			      vargs, owner);
+ 	if (unlikely(rc && !(flags & MAP_FIXED) &&
+ 		     vaddr != UK_PAGING_VADDR_ANY)) {
+ 		/* If addr was meant as a hint and we fail to map, we retry
+@@ -229,7 +235,7 @@ static int do_mmap(void **addr, size_t len, int prot, int flags, int fd,
+ 		 */
+ 		vaddr = UK_PAGING_VADDR_ANY;
+ 		rc = uk_vma_map_owned(vas, &vaddr, len, vattr, vflags, NULL,
+-				      vops, vargs, MMAP_OWNER());
++				      vops, vargs, owner);
+ 	}
+ 
+ #if CONFIG_LIBPOSIX_FDTAB && CONFIG_LIBPOSIX_FDIO
+@@ -361,7 +367,7 @@ static int do_mremap(void *addr, size_t old_len, size_t new_len, int flags,
+ 	 * caller's memory would live as long as the kernel's (brk) or
+ 	 * another process's
+ 	 */
+-	if (vma->owner != MMAP_OWNER())
++	if (vma->owner != MMAP_OWNER() && !(vma->flags & UK_VMA_ANON_SHARED))
+ 		return -ENOMEM;
+ 
+ 	/* The mapping's own flags and owner, so that the two parts merge:
+diff --git a/lib/ukvmem/include/uk/vmem/vma_types.h b/lib/ukvmem/include/uk/vmem/vma_types.h
+index 47b8c62..0a8fb90 100644
+--- a/lib/ukvmem/include/uk/vmem/vma_types.h
++++ b/lib/ukvmem/include/uk/vmem/vma_types.h
+@@ -72,6 +72,7 @@ static inline int uk_vma_reserve_ex(struct uk_vas *vas, __vaddr_t *vaddr,
+  * contents is lost when the memory is unmapped. Demand paging is supported.
+  */
+ extern const struct uk_vma_ops uk_vma_anon_ops;
++#define UK_VMA_ANON_SHARED (1ULL << UK_VMA_MAP_EXTF_SHIFT)
+ 
+ /**
+  * Creates a new anonymous memory mapping. See uk_vma_map() for a description

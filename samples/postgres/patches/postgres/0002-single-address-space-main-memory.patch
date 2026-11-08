@@ -1,0 +1,188 @@
+diff --git a/src/backend/port/sysv_shmem.c b/src/backend/port/sysv_shmem.c
+index eaba244..0e21bab 100644
+--- a/src/backend/port/sysv_shmem.c
++++ b/src/backend/port/sysv_shmem.c
+@@ -97,11 +97,13 @@ static Size AnonymousShmemSize;
+ static void *AnonymousShmem = NULL;
+ 
+ static void *InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size);
++#ifndef HYPERLIGHT_UNIKRAFT
+ static void IpcMemoryDetach(int status, Datum shmaddr);
+ static void IpcMemoryDelete(int status, Datum shmId);
+ static IpcMemoryState PGSharedMemoryAttach(IpcMemoryId shmId,
+ 										   void *attachAt,
+ 										   PGShmemHeader **addr);
++#endif
+ 
+ 
+ /*
+@@ -116,6 +118,7 @@ static IpcMemoryState PGSharedMemoryAttach(IpcMemoryId shmId,
+  * If we fail with a failure code other than collision-with-existing-segment,
+  * print out an error and abort.  Other types of errors are not recoverable.
+  */
++#ifndef HYPERLIGHT_UNIKRAFT
+ static void *
+ InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
+ {
+@@ -300,6 +303,7 @@ IpcMemoryDelete(int status, Datum shmId)
+ 		elog(LOG, "shmctl(%d, %d, 0) failed: %m",
+ 			 DatumGetInt32(shmId), IPC_RMID);
+ }
++#endif
+ 
+ /*
+  * PGSharedMemoryIsInUse
+@@ -315,6 +319,13 @@ IpcMemoryDelete(int status, Datum shmId)
+ bool
+ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
+ {
++#ifdef HYPERLIGHT_UNIKRAFT
++	ereport(FATAL,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("stale shared-memory interlock in a RAM-only guest"),
++			 errhint("Start a fresh VM from the initialized rootfs.")));
++	return true;
++#else
+ 	PGShmemHeader *memAddress;
+ 	IpcMemoryState state;
+ 
+@@ -332,6 +343,7 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
+ 			return true;
+ 	}
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -342,6 +354,7 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
+  *
+  * *addr is set to the segment memory address if we attached to it, else NULL.
+  */
++#ifndef HYPERLIGHT_UNIKRAFT
+ static IpcMemoryState
+ PGSharedMemoryAttach(IpcMemoryId shmId,
+ 					 void *attachAt,
+@@ -451,6 +464,7 @@ PGSharedMemoryAttach(IpcMemoryId shmId,
+ 	 */
+ 	return shmStat.shm_nattch == 0 ? SHMSTATE_UNATTACHED : SHMSTATE_ATTACHED;
+ }
++#endif
+ 
+ /*
+  * Identify the huge page size to use, and compute the related mmap flags.
+@@ -691,6 +705,36 @@ PGShmemHeader *
+ PGSharedMemoryCreate(Size size,
+ 					 PGShmemHeader **shim)
+ {
++#ifdef HYPERLIGHT_UNIKRAFT
++	PGShmemHeader *hdr;
++	struct stat statbuf;
++
++	if (shared_memory_type != SHMEM_TYPE_MMAP || huge_pages == HUGE_PAGES_ON)
++		ereport(FATAL,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("guest requires shared_memory_type=mmap and huge_pages=off")));
++	if (stat(DataDir, &statbuf) != 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not stat data directory \"%s\": %m", DataDir)));
++	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
++	AnonymousShmem = CreateAnonymousSegment(&size);
++	AnonymousShmemSize = size;
++	on_shmem_exit(AnonymousShmemDetach, (Datum) 0);
++	hdr = (PGShmemHeader *) AnonymousShmem;
++	hdr->creatorPID = getpid();
++	hdr->magic = PGShmemMagic;
++	hdr->dsm_control = 0;
++	hdr->device = statbuf.st_dev;
++	hdr->inode = statbuf.st_ino;
++	hdr->totalsize = size;
++	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
++	UsedShmemSegAddr = hdr;
++	UsedShmemSegID = 0;
++	*shim = hdr;
++	AddToDataDirLockFile(LOCK_FILE_LINE_SHMEM_KEY, "        0         0");
++	return hdr;
++#else
+ 	IpcMemoryKey NextShmemSegID;
+ 	void	   *memAddress;
+ 	PGShmemHeader *hdr;
+@@ -855,6 +899,7 @@ PGSharedMemoryCreate(Size size,
+ 		return hdr;
+ 	memcpy(AnonymousShmem, hdr, sizeof(PGShmemHeader));
+ 	return (PGShmemHeader *) AnonymousShmem;
++#endif
+ }
+ 
+ #ifdef EXEC_BACKEND
+@@ -874,6 +919,18 @@ PGSharedMemoryCreate(Size size,
+ void
+ PGSharedMemoryReAttach(void)
+ {
++#ifdef HYPERLIGHT_UNIKRAFT
++	PGShmemHeader *hdr = (PGShmemHeader *) UsedShmemSegAddr;
++	struct stat statbuf;
++
++	Assert(IsUnderPostmaster);
++	if (hdr == NULL || stat(DataDir, &statbuf) != 0 ||
++		hdr->magic != PGShmemMagic ||
++		hdr->device != statbuf.st_dev || hdr->inode != statbuf.st_ino)
++		ereport(FATAL,
++				(errmsg("invalid shared-memory header for this guest data directory")));
++	dsm_set_control_handle(hdr->dsm_control);
++#else
+ 	IpcMemoryId shmid;
+ 	PGShmemHeader *hdr;
+ 	IpcMemoryState state;
+@@ -903,6 +960,7 @@ PGSharedMemoryReAttach(void)
+ 	dsm_set_control_handle(hdr->dsm_control);
+ 
+ 	UsedShmemSegAddr = hdr;		/* probably redundant */
++#endif
+ }
+ 
+ /*
+@@ -954,6 +1012,11 @@ PGSharedMemoryNoReAttach(void)
+ void
+ PGSharedMemoryDetach(void)
+ {
++#ifdef HYPERLIGHT_UNIKRAFT
++	/* Detaching a child must not unmap the postmaster's shared allocation. */
++	UsedShmemSegAddr = NULL;
++	AnonymousShmem = NULL;
++#else
+ 	if (UsedShmemSegAddr != NULL)
+ 	{
+ 		if ((shmdt(UsedShmemSegAddr) < 0)
+@@ -973,4 +1036,5 @@ PGSharedMemoryDetach(void)
+ 				 AnonymousShmem, AnonymousShmemSize);
+ 		AnonymousShmem = NULL;
+ 	}
++#endif
+ }
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 5b047b2..3693862 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -436,7 +436,7 @@ static const struct config_enum_entry shared_memory_options[] = {
+ #ifndef WIN32
+ 	{"sysv", SHMEM_TYPE_SYSV, false},
+ #endif
+-#ifndef EXEC_BACKEND
++#if !defined(EXEC_BACKEND) || defined(HYPERLIGHT_UNIKRAFT)
+ 	{"mmap", SHMEM_TYPE_MMAP, false},
+ #endif
+ #ifdef WIN32
+diff --git a/src/include/storage/pg_shmem.h b/src/include/storage/pg_shmem.h
+index 4dd05f1..f912a34 100644
+--- a/src/include/storage/pg_shmem.h
++++ b/src/include/storage/pg_shmem.h
+@@ -70,7 +70,7 @@ extern PGDLLIMPORT void *ShmemProtectiveRegion;
+ #endif
+ extern PGDLLIMPORT void *UsedShmemSegAddr;
+ 
+-#if !defined(WIN32) && !defined(EXEC_BACKEND)
++#if !defined(WIN32) && (!defined(EXEC_BACKEND) || defined(HYPERLIGHT_UNIKRAFT))
+ #define DEFAULT_SHARED_MEMORY_TYPE SHMEM_TYPE_MMAP
+ #elif !defined(WIN32)
+ #define DEFAULT_SHARED_MEMORY_TYPE SHMEM_TYPE_SYSV

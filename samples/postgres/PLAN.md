@@ -1,7 +1,8 @@
 # PostgreSQL on Hyperlight-Unikraft: experiment plan
 
-Status: **Phase 1 implemented and validated; PostgreSQL itself is not built or
-ported yet**. See [baseline instructions and results](README.md).
+Status: **Phases 1 and 2 implemented and validated; PostgreSQL 16.15 runs as a
+RAM-only server**. See [instructions and results](README.md). Persistent storage
+and recovery remain unimplemented.
 Prepared 2026-11-08.
 
 ## Objective
@@ -96,8 +97,9 @@ Important differences:
 
 ## Proposed repository layout
 
-Phase 1 implements the source pins, baseline recipes, and process probes.
-PostgreSQL packaging and later-phase tests below remain future work.
+Phases 1 and 2 implement source pins, baseline/process probes, PostgreSQL
+patches/packaging, and the concurrent SQL gate. Persistent-storage, spill,
+and recovery tests below remain future work.
 
 ```text
 samples/postgres/
@@ -164,9 +166,10 @@ validation. Record the guest binary checksum and its source/patch/build inputs.
 TLS corruption, or unintended parent-state changes. If this fails, stop the
 PostgreSQL bring-up and fix the minimal probe first.
 
-2026-11-08: all nine native and KVM guest probes pass with the source-built
-kernel, 512 MiB scratch, and one local caught-signal wakeup patch. Phase 2 has
-not started. See [the measured baseline and limitations](README.md).
+2026-11-08: the initial gate passed all nine native and KVM guest probes with
+512 MiB scratch and the caught-signal patch. Phase 2 adds the ownership and
+shared-mapping lifetime fixes; all nine baseline probes still pass.
+See [the measured baseline and limitations](README.md).
 
 ## Phase 2: PostgreSQL build and functional server
 
@@ -213,6 +216,13 @@ database tests.
 two simultaneous sessions can authenticate, create/insert/select, commit and
 roll back, maintain distinct session settings/temp tables, and exit cleanly.
 Repeated connections must not leak memory or confuse backend state.
+
+2026-11-08: this gate passes with PostgreSQL 16.15, a non-root uid/gid 1000
+kernel profile, two SCRAM-authenticated sessions, explicit commit/rollback,
+settings/temp-table isolation, and 24 checked reconnects after four warm-up
+connections. Measured reconnect RSS growth is zero, and graceful shutdown
+returns guest status 0. The profile is explicitly RAM-only with `fsync=off`;
+it does not satisfy a storage or recovery gate. See [results](README.md).
 
 ## Phase 3: persistent filesystem semantics
 

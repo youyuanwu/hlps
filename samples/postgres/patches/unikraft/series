@@ -1,1 +1,3 @@
 0001-wake-caught-signal-waits.patch
+0002-ramfs-single-user-ownership.patch
+0003-shared-anonymous-mapping-lifetime.patch
