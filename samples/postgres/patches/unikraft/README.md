@@ -11,7 +11,7 @@ upstream. The affected source retains its BSD-3-Clause notices.
 The base kernel interrupts blocking system calls for fatal signals but only
 wakes `pause`/`sigsuspend` for caught signals. A child with a `SIGUSR1` handler
 blocked in `read(pipe)` never unwinds its read to dispatch that handler. The
-Phase 1 `signals` probe reports a guest deadlock.
+`signals` process probe reproduces the guest deadlock.
 
 Extract the existing interruption helper and use it for caught, unmasked
 signals as well. A process-directed signal selects one eligible thread;
@@ -21,7 +21,7 @@ the child borrows its stack.
 
 Reproducer/regressions: `signals` (process and pthread handler delivery during
 blocking reads, fatal signal wait status), `blocked-signals` (mask inheritance,
-signalfd, and no forced handler delivery), plus the entire Phase 1 guest suite.
+signalfd, and no forced handler delivery), plus the entire native/KVM process suite.
 `SA_RESTART` remains unsupported by the base kernel; this patch does not
 implement it. The test retries `EINTR` explicitly.
 
@@ -39,7 +39,7 @@ multi-user/chown support or CPIO ownership restoration.
 
 Reproducer/regression: `pg-init` validates the initialized data directory and
 a newly created temporary file against the actual guest uid/gid, then normal
-PostgreSQL ownership checks run unchanged. Original Phase 1 probes validate
+PostgreSQL ownership checks run unchanged. The runtime probes validate
 the default uid-0 kernel profile.
 
 ## 0003: shared anonymous mappings outlive their creator
@@ -60,7 +60,7 @@ Reproducer/regressions: `pg-init` reexecutes a child that creates an 8 KiB
 anonymous shared mapping, reaps it, checks the surviving bytes, shrinks and
 regrows the mapping, and explicitly unmaps it. The full SQL gate checks
 statistics use, backend exit/reconnect, graceful teardown, and bounded RSS
-growth. Ordinary Phase 1 process/TLS/shared-memory probes also run.
+growth. Native/KVM process/TLS/shared-memory probes also run.
 
 ## 0004: hostfs synchronization, ownership, pagination and close semantics
 

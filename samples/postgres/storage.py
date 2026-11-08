@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded host-backed PostgreSQL and observed storage-boundary validation."""
+"""Persistent PostgreSQL demos and observed storage-boundary validation."""
 
 import argparse
 from contextlib import contextmanager
@@ -14,11 +14,11 @@ import subprocess
 import sys
 import time
 
-import phase1
-import phase2
+import runtime
+import postgres
 
-HERE = phase1.HERE
-WORK = phase1.WORK
+HERE = runtime.HERE
+WORK = runtime.WORK
 DATA = WORK / "phase3"
 STORAGE = DATA / "storage"
 ROOTFS = DATA / "rootfs"
@@ -39,31 +39,31 @@ def ownership(path):
 
 
 def inputs():
-    paths = [HERE / "phase1.py", HERE / "phase2.py", HERE / "phase3.py",
+    paths = [HERE / "runtime.py", HERE / "postgres.py", HERE / "storage.py",
              HERE / "Makefile", HERE / "storage-host.rs", HERE / "sources.toml",
              HERE / "tests/storage.c", HERE / "rootfs/init.c", HERE / "rootfs/kernel.conf", PROFILE]
-    for name in (*phase1.PATCH_TARGETS, "postgres"):
-        paths.extend(phase1.patch_files(name))
+    for name in (*runtime.PATCH_TARGETS, "postgres"):
+        paths.extend(runtime.patch_files(name))
         series = HERE / "patches" / name / "series"
         if series.exists():
             paths.append(series)
-    return {str(path): phase1.digest(path) for path in paths}
+    return {str(path): runtime.digest(path) for path in paths}
 
 
 def build():
-    phase1.build(HERE / "rootfs/kernel.conf", DATA)
-    source = phase1.UPSTREAM / "examples/postgres_storage.rs"
+    runtime.build(HERE / "rootfs/kernel.conf", DATA)
+    source = runtime.UPSTREAM / "examples/postgres_storage.rs"
     shutil.copy2(HERE / "storage-host.rs", source)
     env = dict(os.environ, CARGO_BUILD_JOBS="1",
                CARGO_TARGET_DIR=str(WORK / "cargo"), CARGO_PROFILE_DEV_DEBUG="0")
-    phase1.run(["cargo", "build", "--locked", "--example", "postgres_storage"],
-               cwd=phase1.UPSTREAM, env=env)
+    runtime.run(["cargo", "build", "--locked", "--example", "postgres_storage"],
+               cwd=runtime.UPSTREAM, env=env)
     shutil.copy2(WORK / "cargo/debug/examples/postgres_storage", DATA / "storage-host")
-    phase1.run(["cargo", "test", "--locked", "--lib", "hostfs::tests"], cwd=phase1.UPSTREAM, env=env)
-    phase1.run(["cargo", "test", "--locked", "--example", "postgres_storage"], cwd=phase1.UPSTREAM, env=env)
-    phase1.write_json(DATA / "host.json", {
-        "inputs": inputs(), "host_sha256": phase1.digest(DATA / "storage-host"),
-        "kernel_sha256": phase1.digest(DATA / "kernel-build/elfloader_hyperlight-x86_64"),
+    runtime.run(["cargo", "test", "--locked", "--lib", "hostfs::tests"], cwd=runtime.UPSTREAM, env=env)
+    runtime.run(["cargo", "test", "--locked", "--example", "postgres_storage"], cwd=runtime.UPSTREAM, env=env)
+    runtime.write_json(DATA / "host.json", {
+        "inputs": inputs(), "host_sha256": runtime.digest(DATA / "storage-host"),
+        "kernel_sha256": runtime.digest(DATA / "kernel-build/elfloader_hyperlight-x86_64"),
     })
 
 
@@ -71,18 +71,18 @@ def package():
     host = json.loads((DATA / "host.json").read_text())
     if host["inputs"] != inputs():
         raise RuntimeError("storage build inputs changed; run storage-build")
-    phase2.prepare_sources()
-    phase2.verify_postgres_install(False)
-    phase2.verify_postgres_install(True)
+    postgres.prepare_sources()
+    postgres.verify_postgres_install(False)
+    postgres.verify_postgres_install(True)
     if ROOTFS.exists():
         if not (DATA / "build.json").exists():
-            raise RuntimeError("unknown partial Phase 3 rootfs; inspect before cleanup")
+            raise RuntimeError("unknown partial persistent rootfs; inspect before cleanup")
         shutil.rmtree(ROOTFS)
     ROOTFS.mkdir()
     for directory in ("usr/local/bin", "usr/local/lib/postgresql", "usr/local/share",
                       "lib", "etc", "tmp", "dev", "proc/self", "storage", "readonly"):
         (ROOTFS / directory).mkdir(parents=True, exist_ok=True)
-    installed = phase2.DATA / "guest-install/usr/local"
+    installed = postgres.DATA / "guest-install/usr/local"
     shutil.copy2(installed / "bin/postgres", ROOTFS / "usr/local/bin/postgres")
     for directory in ("lib/postgresql", "share/postgresql"):
         shutil.copytree(installed / directory, ROOTFS / "usr/local" / directory,
@@ -92,18 +92,18 @@ def package():
     (ROOTFS / "proc/self/maps").symlink_to("/dev/maps")
     (ROOTFS / "etc/ld-musl-x86_64.path").write_text("/lib:/usr/local/lib:/usr/local/lib/postgresql\n")
     for source, output in ((HERE / "rootfs/init.c", "pg-init"), (HERE / "tests/storage.c", "storage-probe")):
-        phase1.run(["musl-gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+        runtime.run(["musl-gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                     "-march=x86-64", "-fPIE", "-pie", "-pthread", source, "-o", ROOTFS / output])
     names = sorted(str(path.relative_to(ROOTFS)) for path in ROOTFS.rglob("*"))
     with (DATA / "postgres.cpio").open("wb") as archive:
         subprocess.run(["cpio", "-o", "-H", "newc", "--reproducible", "--owner=1000:1000"],
                        cwd=ROOTFS, input=("\n".join(names) + "\n").encode(),
                        stdout=archive, check=True)
-    phase1.write_json(DATA / "build.json", {
+    runtime.write_json(DATA / "build.json", {
         "inputs": inputs(), "host_sha256": host["host_sha256"],
         "kernel_sha256": host["kernel_sha256"],
-        "rootfs_sha256": phase1.digest(DATA / "postgres.cpio"),
-        "postgres_sha256": phase1.digest(ROOTFS / "usr/local/bin/postgres"),
+        "rootfs_sha256": runtime.digest(DATA / "postgres.cpio"),
+        "postgres_sha256": runtime.digest(ROOTFS / "usr/local/bin/postgres"),
     })
 
 
@@ -115,8 +115,8 @@ def initialize():
         password = DATA / "password"
         password.write_text(secrets.token_urlsafe(32) + "\n")
         password.chmod(0o600)
-        phase2.check_version(phase1.run([phase2.NATIVE / "bin/postgres", "--version"], capture=True))
-        phase1.run(["timeout", "--kill-after=5s", "60s", phase2.NATIVE / "bin/initdb",
+        postgres.check_version(runtime.run([postgres.NATIVE / "bin/postgres", "--version"], capture=True))
+        runtime.run(["timeout", "--kill-after=5s", "60s", postgres.NATIVE / "bin/initdb",
                     "-D", STORAGE / "pgdata", "--username=phase2", "--encoding=UTF8",
                     "--locale=C", "--auth-local=reject", "--auth-host=scram-sha-256",
                     f"--pwfile={password}"])
@@ -129,7 +129,7 @@ def initialize():
         (probes / "fail-dir-sync").mkdir()
         for i in range(5000):
             (probes / "many" / f"entry-{i:04}").touch()
-        phase1.write_json(DATA / "storage.json", {"initialized": True, "budget": phase2.BUDGET})
+        runtime.write_json(DATA / "storage.json", {"initialized": True, "budget": postgres.BUDGET})
         write_storage_config()
 
 
@@ -142,10 +142,10 @@ def write_storage_config():
     config.write_text(existing + marker + (HERE / "rootfs/ram-only.conf").read_text()
                       + "\n" + PROFILE.read_text())
     meta = json.loads((DATA / "storage.json").read_text())
-    meta.update(config_sha256=phase1.digest(config),
-                profile_sha256=phase1.digest(PROFILE),
-                hba_sha256=phase1.digest(STORAGE / "pgdata/pg_hba.conf"))
-    phase1.write_json(DATA / "storage.json", meta)
+    meta.update(config_sha256=runtime.digest(config),
+                profile_sha256=runtime.digest(PROFILE),
+                hba_sha256=runtime.digest(STORAGE / "pgdata/pg_hba.conf"))
+    runtime.write_json(DATA / "storage.json", meta)
 
 
 def configure():
@@ -167,17 +167,17 @@ def command(entry, audit, identity, cpu=None):
 
 
 def verify():
-    phase1.verify_upstream()
-    phase1.prepare_patches()
-    phase2.prepare_sources()
+    runtime.verify_upstream()
+    runtime.prepare_patches()
+    postgres.prepare_sources()
     meta = json.loads((DATA / "build.json").read_text())
     if meta["inputs"] != inputs():
-        raise RuntimeError("Phase 3 build inputs changed; rebuild/repackage")
+        raise RuntimeError("Storage build inputs changed; rebuild/repackage")
     for field, path in (("host_sha256", DATA / "storage-host"),
                         ("kernel_sha256", DATA / "kernel-build/elfloader_hyperlight-x86_64"),
                         ("rootfs_sha256", DATA / "postgres.cpio"),
                         ("postgres_sha256", ROOTFS / "usr/local/bin/postgres")):
-        if meta[field] != phase1.digest(path):
+        if meta[field] != runtime.digest(path):
             raise RuntimeError(f"unverified storage artifact: {path}")
 
 
@@ -212,14 +212,14 @@ def validate_audit(rows, postgres):
 
 
 def sql_test():
-    for port in (phase2.PORT, phase2.CONTROL_PORT):
+    for port in (postgres.PORT, postgres.CONTROL_PORT):
         with socket.socket() as reservation:
             reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             reservation.bind(("127.0.0.1", port))
     audit = DATA / f"postgres-audit-{secrets.token_hex(4)}.jsonl"
     identity = secrets.token_hex(16)
     pgpass = DATA / "pgpass"
-    pgpass.write_text(f"127.0.0.1:{phase2.PORT}:postgres:phase2:{(DATA / 'password').read_text().strip()}\n")
+    pgpass.write_text(f"127.0.0.1:{postgres.PORT}:postgres:phase2:{(DATA / 'password').read_text().strip()}\n")
     pgpass.chmod(0o600)
     env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
     env.update(PGPASSFILE=str(pgpass), PGCONNECT_TIMEOUT="2", PGAPPNAME="phase3")
@@ -231,15 +231,15 @@ def sql_test():
             while True:
                 if process.poll() is not None:
                     raise RuntimeError(f"PostgreSQL guest exited {process.returncode}; inspect {DATA / 'guest.log'}")
-                ready = subprocess.run([str(phase2.NATIVE / "bin/pg_isready"), "-h", "127.0.0.1",
-                                        "-p", str(phase2.PORT), "-U", "phase2", "-d", "postgres", "-t", "1"],
+                ready = subprocess.run([str(postgres.NATIVE / "bin/pg_isready"), "-h", "127.0.0.1",
+                                        "-p", str(postgres.PORT), "-U", "phase2", "-d", "postgres", "-t", "1"],
                                        env=env, capture_output=True, timeout=3)
                 if ready.returncode == 0:
                     break
                 if time.monotonic() >= deadline:
                     raise RuntimeError("persistent PostgreSQL startup deadline exceeded")
                 time.sleep(0.1)
-            denied = subprocess.run([sys.executable, str(HERE / "phase3.py"), "lock-probe"],
+            denied = subprocess.run([sys.executable, str(HERE / "storage.py"), "lock-probe"],
                                     capture_output=True, text=True, timeout=5)
             if denied.returncode == 0 or "already owned" not in denied.stderr:
                 raise RuntimeError("the running VM host did not retain exclusive storage ownership")
@@ -249,26 +249,26 @@ def sql_test():
             if competing.returncode == 0 or competing_audit.exists() or \
                     not any(word in competing.stderr.lower() for word in ("wouldblock", "would block")):
                 raise RuntimeError("a competing VM host was not rejected before opening storage")
-            with phase2.Session("storage", env, DATA) as session:
+            with postgres.Session("storage", env, DATA) as session:
                 for name, value in (("fsync", "on"), ("synchronous_commit", "on"), ("wal_sync_method", "fsync")):
-                    phase2.expect(session, f"SHOW {name};", [value])
+                    postgres.expect(session, f"SHOW {name};", [value])
                 session.execute("DROP TABLE IF EXISTS storage_gate; CREATE TABLE storage_gate(id int primary key);"
                                 "BEGIN; INSERT INTO storage_gate VALUES (42); COMMIT; CHECKPOINT;")
-                phase2.expect(session, "SELECT id FROM storage_gate;", ["42"])
-                phase2.expect(session, "SELECT count(*) FROM pg_stat_activity WHERE backend_type IN "
+                postgres.expect(session, "SELECT id FROM storage_gate;", ["42"])
+                postgres.expect(session, "SELECT count(*) FROM pg_stat_activity WHERE backend_type IN "
                               "('checkpointer','background writer','walwriter');", ["3"])
         finally:
-            code = phase2.stop_guest(process, identity)
+            code = postgres.stop_guest(process, identity)
     output = (DATA / "guest.log").read_text()
-    phase1.validate_result("postmaster-shutdown", output, code)
+    runtime.validate_result("postmaster-shutdown", output, code)
     if (STORAGE / "pgdata/postmaster.pid").exists():
         raise RuntimeError("postmaster lockfile left after clean shutdown")
     rows = audit_rows(audit)
     validate_audit(rows, True)
-    if phase2.bytes_in(STORAGE) > phase2.BUDGET:
+    if postgres.bytes_in(STORAGE) > postgres.BUDGET:
         raise RuntimeError("live storage budget exceeded")
     return {"audit": str(audit), "successful_syncs": sum(r["operation"].startswith("sync") and r["ok"] for r in rows),
-            "storage_bytes": phase2.bytes_in(STORAGE), "guest_exit": code}
+            "storage_bytes": postgres.bytes_in(STORAGE), "guest_exit": code}
 
 
 def test():
@@ -279,10 +279,10 @@ def test():
     for field, path in (("config_sha256", STORAGE / "pgdata/postgresql.conf"),
                         ("hba_sha256", STORAGE / "pgdata/pg_hba.conf"),
                         ("profile_sha256", PROFILE)):
-        if storage_meta.get(field) != phase1.digest(path):
+        if storage_meta.get(field) != runtime.digest(path):
             raise RuntimeError("persistent configuration changed; use storage-config explicitly")
     result = {"status": "running"}
-    phase1.write_json(DATA / "results.json", result)
+    runtime.write_json(DATA / "results.json", result)
     with ownership(STORAGE):
         for name in ("io", "renamed", "sync-write", "dsync-write", "fail-sync",
                      "partial-write", "quota", "mode-dir"):
@@ -298,7 +298,7 @@ def test():
                                    cwd=WORK, capture_output=True, text=True, timeout=130)
         (DATA / "probes.log").write_text(completed.stdout + completed.stderr)
         print(completed.stdout, end="")
-        phase1.validate_result("storage", completed.stdout, completed.returncode)
+        runtime.validate_result("storage", completed.stdout, completed.returncode)
         validate_audit(audit_rows(audit), False)
         result["probe_audit"] = str(audit)
         result["postgres"] = sql_test()
@@ -308,8 +308,8 @@ def test():
         result.update(status="failed", error=str(error))
         raise
     finally:
-        phase1.write_json(DATA / "results.json", result)
-    print("PASS phase3: observed syncs/errors, paginated directory, single writer, host-backed PostgreSQL")
+        runtime.write_json(DATA / "results.json", result)
+    print("PASS persistent-sql: observed syncs/errors, paginated directory, single writer, host-backed PostgreSQL")
 
 
 def main():

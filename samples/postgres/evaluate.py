@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serial, affinity-pinned PostgreSQL evaluation with exact SQL validation."""
+"""Serial native/guest PostgreSQL benchmarks with exact SQL validation."""
 
 import argparse
 from contextlib import contextmanager
@@ -16,12 +16,12 @@ import subprocess
 import threading
 import time
 
-import phase1
-import phase2
-import phase3
-import phase4
+import runtime
+import postgres
+import storage
+import recovery
 
-DATA = phase1.WORK / "phase5"
+DATA = runtime.WORK / "phase5"
 CLIENT = DATA / "query-client"
 COUNTS = {"select": 1000, "lookup": 1000, "commit": 300, "spill": 5}
 PROFILE_COUNTS = {"select": 50, "lookup": 50, "commit": 50, "spill": 1}
@@ -29,22 +29,22 @@ REPEATS = 3
 
 
 def client_inputs():
-    return {str(path): phase1.digest(path) for path in (
-        phase1.HERE / "tests/query-client.c",
-        phase2.NATIVE / "include/libpq-fe.h",
-        (phase2.NATIVE / "lib/libpq.so").resolve(),
+    return {str(path): runtime.digest(path) for path in (
+        runtime.HERE / "tests/query-client.c",
+        postgres.NATIVE / "include/libpq-fe.h",
+        (postgres.NATIVE / "lib/libpq.so").resolve(),
     )}
 
 
 def build():
-    phase2.verify_postgres_install(False)
-    phase1.run(["gcc", "-std=c11", "-O2", "-march=x86-64", "-Wall", "-Wextra", "-Werror",
-                f"-I{phase2.NATIVE / 'include'}", phase1.HERE / "tests/query-client.c",
-                f"-L{phase2.NATIVE / 'lib'}", f"-Wl,-rpath,{phase2.NATIVE / 'lib'}",
+    postgres.verify_postgres_install(False)
+    runtime.run(["gcc", "-std=c11", "-O2", "-march=x86-64", "-Wall", "-Wextra", "-Werror",
+                f"-I{postgres.NATIVE / 'include'}", runtime.HERE / "tests/query-client.c",
+                f"-L{postgres.NATIVE / 'lib'}", f"-Wl,-rpath,{postgres.NATIVE / 'lib'}",
                 "-lpq", "-o", CLIENT])
-    phase1.write_json(DATA / "build.json", {
-        "inputs": client_inputs(), "client_sha256": phase1.digest(CLIENT),
-        "compiler": phase1.run(["gcc", "--version"], capture=True).splitlines()[0],
+    runtime.write_json(DATA / "build.json", {
+        "inputs": client_inputs(), "client_sha256": runtime.digest(CLIENT),
+        "compiler": runtime.run(["gcc", "--version"], capture=True).splitlines()[0],
     })
 
 
@@ -114,7 +114,7 @@ class Memory:
 
     def sample(self):
         pss = rss = processes = 0
-        for pid in (self.pid, *phase2.descendants(self.pid)):
+        for pid in (self.pid, *postgres.descendants(self.pid)):
             try:
                 if os.sched_getaffinity(pid) != {self.cpu}:
                     raise RuntimeError(f"server process {pid} escaped its CPU allowance")
@@ -138,7 +138,7 @@ class Memory:
         self.peak_pss = max(self.peak_pss, pss)
         self.peak_rss = max(self.peak_rss, rss)
         self.peak_processes = max(self.peak_processes, processes)
-        if pss > phase4.RSS_LIMIT:
+        if pss > recovery.RSS_LIMIT:
             raise RuntimeError("server process-tree PSS exceeded 1 GiB")
 
     def monitor(self):
@@ -191,15 +191,15 @@ def profile_rows(path):
 
 
 def prepare(session, run_dir, name):
-    session.execute(phase4.FIXTURE + "CREATE UNIQUE INDEX ON spill_fixture(id);"
+    session.execute(recovery.FIXTURE + "CREATE UNIQUE INDEX ON spill_fixture(id);"
                     "DROP TABLE IF EXISTS eval_commits;"
                     "CREATE TABLE eval_commits(id int primary key,counter bigint NOT NULL);"
                     "INSERT INTO eval_commits VALUES (1,0);", timeout=60)
     plan = json.loads("\n".join(session.execute(
-        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + phase4.CHECKSUM, timeout=60)))
-    phase1.write_json(run_dir / f"{name}-explain.json", plan)
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + recovery.CHECKSUM, timeout=60)))
+    runtime.write_json(run_dir / f"{name}-explain.json", plan)
     session.execute("CHECKPOINT;")
-    return phase4.validate_spill(plan)
+    return recovery.validate_spill(plan)
 
 
 def run_client(run_dir, name, port, env, checksum, cpu, profiled):
@@ -216,42 +216,42 @@ def run_client(run_dir, name, port, env, checksum, cpu, profiled):
 
 
 def storage_summary(root):
-    used = phase2.bytes_in(root)
-    if used > phase2.BUDGET or phase4.temp_files(root):
+    used = postgres.bytes_in(root)
+    if used > postgres.BUDGET or recovery.temp_files(root):
         raise RuntimeError("evaluation exceeded storage budget or left spill files")
-    return {"storage_bytes": used, "pgdata_bytes": phase2.bytes_in(root / "pgdata")
+    return {"storage_bytes": used, "pgdata_bytes": postgres.bytes_in(root / "pgdata")
             if (root / "pgdata").exists() else used,
-            "wal_bytes": phase2.bytes_in(root / ("pgdata/pg_wal" if (root / "pgdata").exists() else "pg_wal"))}
+            "wal_bytes": postgres.bytes_in(root / ("pgdata/pg_wal" if (root / "pgdata").exists() else "pg_wal"))}
 
 
 def measure(mode, repeat, run_dir, env, checksum, server_cpu, client_cpu, profiled=False):
     name = f"{mode}-{repeat}"
     result = {"mode": mode, "repeat": repeat, "profiled": profiled}
     if mode == "native":
-        with phase4.native_server(env, server_cpu) as (process, startup):
+        with recovery.native_server(env, server_cpu) as (process, startup):
             with Memory(process.pid, server_cpu) as memory:
-                with phase2.Session(name + "-setup", env, run_dir, phase4.NATIVE_PORT) as session:
+                with postgres.Session(name + "-setup", env, run_dir, recovery.NATIVE_PORT) as session:
                     result["spill_evidence"] = prepare(session, run_dir, name)
                 result["timings"] = run_client(
-                    run_dir, name, phase4.NATIVE_PORT, env, checksum, client_cpu, False)
-                with phase2.Session(name + "-checkpoint", env, run_dir, phase4.NATIVE_PORT) as session:
+                    run_dir, name, recovery.NATIVE_PORT, env, checksum, client_cpu, False)
+                with postgres.Session(name + "-checkpoint", env, run_dir, recovery.NATIVE_PORT) as session:
                     session.execute("CHECKPOINT;")
         result.update(startup_ns=startup, memory=memory.result(),
-                      storage=storage_summary(phase4.NATIVE_DATA))
-        (run_dir / f"{name}-guest.log").write_bytes((phase4.DATA / "native.log").read_bytes())
+                      storage=storage_summary(recovery.NATIVE_DATA))
+        (run_dir / f"{name}-guest.log").write_bytes((recovery.DATA / "native.log").read_bytes())
     else:
         report = run_dir / f"{name}-profile.txt" if profiled else None
-        with phase4.VM(name, env, run_dir, server_cpu, report) as vm:
+        with recovery.VM(name, env, run_dir, server_cpu, report) as vm:
             with Memory(vm.host_pid, server_cpu) as memory:
                 with vm.session("setup") as session:
                     result["spill_evidence"] = prepare(session, run_dir, name)
                 result["timings"] = run_client(
-                    run_dir, name, phase2.PORT, env, checksum, client_cpu, profiled)
+                    run_dir, name, postgres.PORT, env, checksum, client_cpu, profiled)
                 with vm.session("checkpoint") as session:
                     session.execute("CHECKPOINT;")
         result.update(startup_ns=vm.startup_ns, memory=memory.result(), host=vm.result,
-                      storage=storage_summary(phase3.STORAGE))
-        rows = phase3.audit_rows(vm.audit)
+                      storage=storage_summary(storage.STORAGE))
+        rows = storage.audit_rows(vm.audit)
         errors = [row for row in rows if not row["ok"]]
         if errors:
             raise RuntimeError(f"guest evaluation reported host filesystem errors: {errors[:3]}")
@@ -292,7 +292,7 @@ def summarize(runs):
 
 
 def environment(server_cpu, client_cpu):
-    cpu = json.loads(phase1.run(["lscpu", "--json"], capture=True))["lscpu"]
+    cpu = json.loads(runtime.run(["lscpu", "--json"], capture=True))["lscpu"]
     interesting = {"CPU(s):", "Model name:", "Thread(s) per core:", "Core(s) per socket:",
                    "Hypervisor vendor:", "Virtualization type:"}
     governor = Path(f"/sys/devices/system/cpu/cpu{server_cpu}/cpufreq/scaling_governor")
@@ -304,44 +304,44 @@ def environment(server_cpu, client_cpu):
         "cpu": {row["field"]: row["data"] for row in cpu if row["field"] in interesting},
         "server_cpu": server_cpu, "client_cpu": client_cpu,
         "frequency_governor": governor.read_text().strip() if governor.exists() else "not exposed",
-        "filesystem": json.loads(phase1.run(
+        "filesystem": json.loads(runtime.run(
             ["findmnt", "--json", "--target", DATA, "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"], capture=True)),
-        "gcc": phase1.run(["gcc", "--version"], capture=True).splitlines()[0],
-        "rustc": phase1.run(["rustc", "--version"], capture=True).strip(),
-        "glibc": phase1.run(["ldd", "--version"], capture=True).splitlines()[0],
+        "gcc": runtime.run(["gcc", "--version"], capture=True).splitlines()[0],
+        "rustc": runtime.run(["rustc", "--version"], capture=True).strip(),
+        "glibc": runtime.run(["ldd", "--version"], capture=True).splitlines()[0],
         "musl": musl.stderr.splitlines()[:3],
-        "postgres": phase1.run([phase2.NATIVE / "bin/postgres", "--version"], capture=True).strip(),
+        "postgres": runtime.run([postgres.NATIVE / "bin/postgres", "--version"], capture=True).strip(),
         "load_average": list(os.getloadavg()),
         "meminfo": Path("/proc/meminfo").read_text(),
         "cache_conditions": "fresh server processes; host caches retained; fixture/EXPLAIN/checkpoint preparation and per-workload warmup",
         "compiler_profile": "PG/client -O2 -march=x86-64; guest assertions on, native off; Rust host dev, debug=0, opt-level=0",
-        "sources": phase1.pins(),
+        "sources": runtime.pins(),
     }
 
 
 def verify():
-    phase3.verify()
-    phase2.verify_postgres_install(False)
+    storage.verify()
+    postgres.verify_postgres_install(False)
     build_meta = json.loads((DATA / "build.json").read_text())
-    if build_meta["inputs"] != client_inputs() or build_meta["client_sha256"] != phase1.digest(CLIENT):
-        raise RuntimeError("evaluation client changed; run eval-build")
-    gate = json.loads((phase4.DATA / "results.json").read_text())
+    if build_meta["inputs"] != client_inputs() or build_meta["client_sha256"] != runtime.digest(CLIENT):
+        raise RuntimeError("evaluation client changed; run benchmark-build")
+    gate = json.loads((recovery.DATA / "results.json").read_text())
     expected = {
-        "phase4_sha256": phase1.digest(phase1.HERE / "phase4.py"),
-        "host_sha256": phase1.digest(phase3.DATA / "storage-host"),
-        "rootfs_sha256": phase1.digest(phase3.DATA / "postgres.cpio"),
-        "native_postgres_sha256": phase1.digest(phase2.NATIVE / "bin/postgres"),
-        "native_psql_sha256": phase1.digest(phase2.NATIVE / "bin/psql"),
+        "phase4_sha256": runtime.digest(runtime.HERE / "recovery.py"),
+        "host_sha256": runtime.digest(storage.DATA / "storage-host"),
+        "rootfs_sha256": runtime.digest(storage.DATA / "postgres.cpio"),
+        "native_postgres_sha256": runtime.digest(postgres.NATIVE / "bin/postgres"),
+        "native_psql_sha256": runtime.digest(postgres.NATIVE / "bin/psql"),
     }
     if gate["status"] != "passed" or gate["inputs"] != expected:
-        raise RuntimeError("current inputs have not passed Phase 4; run recovery-test first")
-    meta = json.loads((phase3.DATA / "storage.json").read_text())
-    for field, path in (("config_sha256", phase3.STORAGE / "pgdata/postgresql.conf"),
-                        ("profile_sha256", phase3.PROFILE),
-                        ("hba_sha256", phase3.STORAGE / "pgdata/pg_hba.conf")):
-        if meta.get(field) != phase1.digest(path):
+        raise RuntimeError("current inputs have not passed recovery validation; run recovery-test first")
+    meta = json.loads((storage.DATA / "storage.json").read_text())
+    for field, path in (("config_sha256", storage.STORAGE / "pgdata/postgresql.conf"),
+                        ("profile_sha256", storage.PROFILE),
+                        ("hba_sha256", storage.STORAGE / "pgdata/pg_hba.conf")):
+        if meta.get(field) != runtime.digest(path):
             raise RuntimeError("persistent configuration changed; run storage-config and recovery-test")
-    if phase4.FAULT.exists() or phase4.FAULT.with_suffix(".new").exists():
+    if recovery.FAULT.exists() or recovery.FAULT.with_suffix(".new").exists():
         raise RuntimeError("leftover WAL fault controls; inspect before evaluation")
     return expected
 
@@ -366,12 +366,12 @@ def test():
     run_dir.mkdir()
     result = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
               "environment": environment(server_cpu, client_cpu), "runs": [],
-              "inputs": dict(inputs, client_sha256=phase1.digest(CLIENT),
-                             phase5_sha256=phase1.digest(phase1.HERE / "phase5.py"))}
-    phase1.write_json(DATA / "results.json", result)
-    env = phase4.environment()
+              "inputs": dict(inputs, client_sha256=runtime.digest(CLIENT),
+                             phase5_sha256=runtime.digest(runtime.HERE / "evaluate.py"))}
+    runtime.write_json(DATA / "results.json", result)
+    env = recovery.environment()
     env["PGAPPNAME"] = "phase5"
-    checksum = phase4.expected_checksum()
+    checksum = recovery.expected_checksum()
     try:
         with client_affinity(client_cpu):
             for repeat in range(REPEATS):
@@ -379,7 +379,7 @@ def test():
                 for mode in order:
                     result["runs"].append(measure(
                         mode, repeat, run_dir, env, checksum, server_cpu, client_cpu))
-                    phase1.write_json(DATA / "results.json", result)
+                    runtime.write_json(DATA / "results.json", result)
             result["summary"] = summarize(result["runs"])
             result["diagnostic"] = measure(
                 "guest", "profile", run_dir, env, checksum, server_cpu, client_cpu, profiled=True)
@@ -389,9 +389,9 @@ def test():
         result.update(status="failed", error=str(error))
         raise
     finally:
-        phase1.write_json(DATA / "results.json", result)
-        phase1.write_json(run_dir / "results.json", result)
-    print("PASS phase5: six serial pinned runs and separate filesystem profile")
+        runtime.write_json(DATA / "results.json", result)
+        runtime.write_json(run_dir / "results.json", result)
+    print("PASS benchmark: six serial pinned runs and separate filesystem profile")
 
 
 def main():
@@ -399,7 +399,7 @@ def main():
     parser.add_argument("command", choices=("build", "test"))
     command = parser.parse_args().command
     DATA.mkdir(parents=True, exist_ok=True)
-    with (phase1.WORK / "phase1.lock").open("w") as lock:
+    with (runtime.WORK / "phase1.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         {"build": build, "test": test}[command]()
 
