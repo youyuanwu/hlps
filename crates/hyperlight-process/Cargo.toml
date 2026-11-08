@@ -1,5 +1,5 @@
 [package]
-name = "hl-native-runner"
+name = "hyperlight-process"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

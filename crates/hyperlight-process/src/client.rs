@@ -14,7 +14,7 @@ use crate::protocol::{
 /// Configure a native executable and its typed host callbacks before spawning it.
 ///
 /// ```no_run
-/// use hl_native_runner::RunnerBuilder;
+/// use hyperlight_process::RunnerBuilder;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let mut runner = RunnerBuilder::from_executable("my-native-runner")

@@ -9,7 +9,7 @@ default-run = "hyperlight-c-guest-native-demo"
 
 [dependencies]
 anyhow.workspace = true
-hl-native-runner.workspace = true
+hyperlight-process.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

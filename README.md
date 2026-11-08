@@ -10,7 +10,7 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
 
 ## Rust workspace
 
-- [hl-native-runner](crates/hl-native-runner/): generic native C guest adapter,
+- [hyperlight-process](crates/hyperlight-process/): generic native C guest adapter,
   Vercode IPC protocol, and reusable Rust subprocess client.
 - [KVM host](samples/c-guest/host/): the original Hyperlight micro-VM demo.
 - [Native sample](samples/c-guest/native/): statically linked runner and parent demo.

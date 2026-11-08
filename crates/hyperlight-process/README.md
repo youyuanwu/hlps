@@ -1,4 +1,4 @@
-# Native Hyperlight C guest runner
+# hyperlight-process
 
 This crate implements the Hyperlight **0.19.0 C function-call ABI** for native,
 statically linked guests on **Linux x86_64**. It contains:
@@ -26,7 +26,7 @@ unsafe extern "C" {
 }
 
 fn main() -> anyhow::Result<()> {
-    unsafe { hl_native_runner::runtime::run(hyperlight_main) }
+    unsafe { hyperlight_process::runtime::run(hyperlight_main) }
 }
 ```
 
@@ -41,7 +41,7 @@ See the [sample build script](../../samples/c-guest/native/build.rs) and
 ## Parent process
 
 ```rust,no_run
-use hl_native_runner::RunnerBuilder;
+use hyperlight_process::RunnerBuilder;
 
 # fn main() -> anyhow::Result<()> {
 let mut runner = RunnerBuilder::from_executable("my-native-runner")
@@ -64,7 +64,7 @@ Return types can be explicit (`call::<i64>`) or inferred from a typed variable.
 The native API reuses `hyperlight-common`'s `ParameterTuple`,
 `SupportedParameterType`, and `SupportedReturnType` traits rather than
 maintaining a second set of type/tuple implementations. These are re-exported
-from `hl_native_runner::func`, together with `Bytes` for `Vec<Bytes>` byte chunks.
+from `hyperlight_process::func`, together with `Bytes` for `Vec<Bytes>` byte chunks.
 The process still uses Vercode, not Hyperlight's FlatBuffers transport or VMM.
 
 Host callbacks accept `FnMut + Send + 'static` closures with individually typed
@@ -136,6 +136,6 @@ negotiate new capabilities or bump the protocol version for breaking changes.
 From the repository root:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo test -p hl-native-runner -p hyperlight-c-guest-native --locked
+CARGO_BUILD_JOBS=1 cargo test -p hyperlight-process -p hyperlight-c-guest-native --locked
 CARGO_BUILD_JOBS=1 make -C samples/c-guest run-native
 ```

@@ -14,7 +14,7 @@ anyhow = "1"
 libc = "0.2"
 hyperlight-common = { version = "=0.19.0", default-features = false, features = ["std"] }
 vercode = "=0.7.0"
-hl-native-runner = { path = "crates/hl-native-runner" }
+hyperlight-process = { path = "crates/hyperlight-process" }
 
 [profile.dev]
 debug = 0
