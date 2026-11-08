@@ -44,6 +44,11 @@ build/guest: guest.c sdk/.ready
 	$(CC) $(GUEST_CFLAGS) $(CFLAGS) $(GUEST_LDFLAGS) -o "$@" guest.c \
 		sdk/release/libhyperlight_guest_capi.a
 
+build/benchmark-guest: ../benchmark/guest.c sdk/.ready Makefile
+	mkdir -p build
+	$(CC) $(GUEST_CFLAGS) $(GUEST_LDFLAGS) -o "$@" ../benchmark/guest.c \
+		sdk/release/libhyperlight_guest_capi.a
+
 guest: build/guest
 
 host:
@@ -81,5 +86,5 @@ test-native: build/native-include/.ready
 	$(CARGO) test --locked --manifest-path native/Cargo.toml
 
 clean:
-	rm -f build/guest build/guest-test
+	rm -f build/guest build/guest-test build/benchmark-guest
 	$(CARGO) clean --manifest-path "$(WORKSPACE)/Cargo.toml"
