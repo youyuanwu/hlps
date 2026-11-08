@@ -1,6 +1,8 @@
-//! Hyperlight's typed function traits with native IPC value conversions.
+//! Hyperlight's typed function traits with owned native value conversions.
 
-use anyhow::{Result, bail, ensure};
+use std::collections::BTreeMap;
+
+use anyhow::{Context, Result, bail, ensure};
 use hyperlight_common::flatbuffer_wrappers::function_types::ParameterType;
 use hyperlight_common::for_each_tuple;
 use hyperlight_common::func::{ParameterValue, ResultType, ReturnType, ReturnValue};
@@ -9,7 +11,67 @@ pub use hyperlight_common::func::{
     Bytes, ParameterTuple, SupportedParameterType, SupportedReturnType,
 };
 
-use crate::protocol::{FunctionCall, Value, ValueType};
+use crate::protocol::{CallError, CallResult, FunctionCall, Value, ValueType};
+
+pub(crate) fn guest_call<Output: SupportedReturnType>(
+    function: &str,
+    arguments: impl ParameterTuple,
+) -> FunctionCall {
+    FunctionCall {
+        function: function.into(),
+        arguments: arguments
+            .into_value()
+            .into_iter()
+            .map(Value::from)
+            .collect(),
+        return_type: Output::TYPE.into(),
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HostFunctions {
+    functions: BTreeMap<String, RegisteredHostFunction>,
+    validation_error: Option<anyhow::Error>,
+}
+
+impl HostFunctions {
+    pub fn register<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        function: impl Into<HostFunction<Output, Args>>,
+    ) {
+        if name.is_empty() || name.contains('\0') {
+            self.validation_error = Some(anyhow::anyhow!(
+                "host function name must be nonempty and contain no NUL"
+            ));
+        } else {
+            self.functions
+                .insert(name.to_owned(), function.into().into());
+        }
+    }
+
+    pub fn validate(&mut self) -> Result<()> {
+        match self.validation_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub fn dispatch(&mut self, call: FunctionCall) -> CallResult {
+        let result = self
+            .functions
+            .get_mut(&call.function)
+            .with_context(|| format!("unregistered host function: {}", call.function))
+            .and_then(|function| function.call(call));
+        match result {
+            Ok(value) => CallResult::Value(value),
+            Err(error) => CallResult::Error(CallError {
+                code: 17,
+                message: format!("{error:#}"),
+            }),
+        }
+    }
+}
 
 /// A typed host callback accepting up to 32 arguments and a plain or fallible return.
 pub struct HostFunction<Output: SupportedReturnType, Args: ParameterTuple> {

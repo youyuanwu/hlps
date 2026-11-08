@@ -1,12 +1,16 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_int};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::abi::{self, ByteChunk, ByteChunks, ByteVector, GuestFunction, OwnedValue, ReturnValue};
+use crate::func::HostFunctions;
 use crate::protocol::{
     CallError, CallResult, FunctionCall, FunctionSignature, Message, PROTOCOL_VERSION, Value,
     ValueType, read_message, write_message,
@@ -34,10 +38,86 @@ struct State {
     ready: bool,
     input: Option<Box<dyn Read>>,
     output: Option<Box<dyn Write>>,
+    direct_host: Option<Rc<RefCell<HostFunctions>>>,
 }
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ActiveState<'a>(&'a mut State);
+
+impl<'a> ActiveState<'a> {
+    fn enter(state: &'a mut State) -> Result<Self> {
+        ensure!(
+            !ACTIVE.get(),
+            "reentrant native guest execution is unsupported on this thread"
+        );
+        STATE.with_borrow_mut(|active| std::mem::swap(active, state));
+        ACTIVE.set(true);
+        Ok(Self(state))
+    }
+}
+
+impl Drop for ActiveState<'_> {
+    fn drop(&mut self) {
+        STATE.with_borrow_mut(|active| std::mem::swap(active, self.0));
+        ACTIVE.set(false);
+    }
+}
+
+pub(crate) struct NativeRuntime {
+    state: State,
+    functions: Vec<FunctionSignature>,
+    poisoned: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl NativeRuntime {
+    pub unsafe fn new(
+        initialize: unsafe extern "C" fn(),
+        host_functions: HostFunctions,
+    ) -> Result<Self> {
+        let mut state = State {
+            direct_host: Some(Rc::new(RefCell::new(host_functions))),
+            ..State::default()
+        };
+        let functions = {
+            let _active = ActiveState::enter(&mut state)?;
+            let functions = unsafe { initialize_guest(initialize)? };
+            STATE.with_borrow_mut(|state| state.ready = true);
+            functions
+        };
+        Ok(Self {
+            state,
+            functions,
+            poisoned: false,
+            _thread_bound: PhantomData,
+        })
+    }
+
+    pub fn functions(&self) -> &[FunctionSignature] {
+        &self.functions
+    }
+
+    pub fn call(&mut self, call: FunctionCall) -> Result<Value> {
+        ensure!(
+            !self.poisoned,
+            "in-process runner is unusable after a host callback panic"
+        );
+        let (result, fatal) = {
+            let _active = ActiveState::enter(&mut self.state)?;
+            let result = unsafe { execute(&call) };
+            let fatal = STATE.with_borrow_mut(|state| state.fatal.take());
+            (result, fatal)
+        };
+        if let Some(error) = fatal {
+            self.poisoned = true;
+            return Err(error);
+        }
+        result.map_err(Into::into)
+    }
 }
 
 fn record_error(code: i32, message: String) {
@@ -93,22 +173,19 @@ unsafe fn run_with_io(
     input: Box<dyn Read>,
     output: Box<dyn Write>,
 ) -> Result<()> {
-    STATE.with_borrow_mut(|state| {
-        *state = State {
-            input: Some(input),
-            output: Some(output),
-            next_callback: 1,
-            ..State::default()
-        }
-    });
-    let result = unsafe { serve(initialize) };
-    STATE.with_borrow_mut(|state| *state = State::default());
-    result
+    let mut state = State {
+        input: Some(input),
+        output: Some(output),
+        next_callback: 1,
+        ..State::default()
+    };
+    let _active = ActiveState::enter(&mut state)?;
+    unsafe { serve(initialize) }
 }
 
-unsafe fn serve(initialize: unsafe extern "C" fn()) -> Result<()> {
+unsafe fn initialize_guest(initialize: unsafe extern "C" fn()) -> Result<Vec<FunctionSignature>> {
     unsafe { initialize() };
-    let functions = STATE.with_borrow_mut(|state| -> Result<Vec<_>> {
+    STATE.with_borrow_mut(|state| -> Result<Vec<_>> {
         if let Some(error) = state.error.take() {
             return Err(error.into());
         }
@@ -117,7 +194,11 @@ unsafe fn serve(initialize: unsafe extern "C" fn()) -> Result<()> {
             .values()
             .map(|function| function.signature.clone())
             .collect())
-    })?;
+    })
+}
+
+unsafe fn serve(initialize: unsafe extern "C" fn()) -> Result<()> {
+    let functions = unsafe { initialize_guest(initialize)? };
     send(&Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         functions,
@@ -291,6 +372,24 @@ pub unsafe extern "C" fn hl_call_host_function(call: *const abi::FunctionCall) {
         }
     };
     let exchange = (|| -> Result<CallResult> {
+        if let Some(host) = STATE.with_borrow(|state| state.direct_host.clone()) {
+            // Catch only user callback panics, before they can cross the C ABI.
+            return match catch_unwind(AssertUnwindSafe(|| {
+                host.borrow_mut().dispatch(call.clone())
+            })) {
+                Ok(result) => Ok(result),
+                Err(payload) => {
+                    let message = if let Some(message) = payload.downcast_ref::<String>() {
+                        message.as_str()
+                    } else if let Some(message) = payload.downcast_ref::<&str>() {
+                        message
+                    } else {
+                        "non-string panic payload"
+                    };
+                    bail!("host callback {} panicked: {message}", call.function)
+                }
+            };
+        }
         let id = STATE.with_borrow_mut(|state| -> Result<u64> {
             let id = state.next_callback;
             state.next_callback = id.checked_add(1).context("host callback ID overflow")?;
@@ -940,5 +1039,116 @@ mod tests {
                 .contains("initialization handshake")
         );
         assert!(output.0.borrow().is_empty());
+        let error = unsafe {
+            crate::InProcessRunnerBuilder::new(invalid)
+                .host_function("TooEarly", || -> bool {
+                    panic!("initialization reached a host callback")
+                })
+                .build()
+        }
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("initialization handshake"));
+    }
+
+    fn direct_runner(value_type: ValueType) -> Result<crate::InProcessRunner> {
+        use crate::func::Bytes;
+        let builder = crate::InProcessRunnerBuilder::new(initialize);
+        macro_rules! register {
+            ($type:ty) => {
+                builder.host_function("ParentEcho", |value: $type| value)
+            };
+        }
+        let builder = match value_type {
+            ValueType::Int => register!(i32),
+            ValueType::UInt => register!(u32),
+            ValueType::Long => register!(i64),
+            ValueType::ULong => register!(u64),
+            ValueType::Float => register!(f32),
+            ValueType::Double => register!(f64),
+            ValueType::String => register!(String),
+            ValueType::Bool => register!(bool),
+            ValueType::Void => builder.host_function("ParentEcho", || ()),
+            ValueType::Bytes => register!(Vec<u8>),
+            ValueType::ByteChunks => register!(Vec<Bytes>),
+        };
+        unsafe { builder.build() }
+    }
+
+    #[test]
+    fn direct_execution_and_callbacks_support_every_value_type() -> Result<()> {
+        let mut values = values();
+        values.extend([Value::Bytes(vec![]), Value::ByteChunks(vec![])]);
+        for value in values {
+            let mut runner = direct_runner(value.value_type())?;
+            for prefix in ["Echo", "Bounce"] {
+                let Message::Call { call, .. } = call_message(1, prefix, &value) else {
+                    unreachable!()
+                };
+                assert_eq!(runner.call_dynamic(call)?, value);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_execution_bypasses_the_vercode_frame_limit() -> Result<()> {
+        let mut runner = direct_runner(ValueType::Bytes)?;
+        let bytes = vec![0x7f; crate::protocol::MAX_FRAME_SIZE + 1];
+        let echoed = runner.call::<Vec<u8>>("EchoBytes", bytes.clone())?;
+        assert_eq!(echoed, bytes);
+        let bounced = runner.call::<Vec<u8>>("BounceBytes", bytes.clone())?;
+        assert_eq!(bounced, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_execution_restores_state_on_rust_unwind() -> Result<()> {
+        let mut state = State::default();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _active = ActiveState::enter(&mut state).unwrap();
+            panic!("test unwind outside the C boundary");
+        }));
+        assert!(panic.is_err());
+        assert!(!ACTIVE.get());
+        let mut runner = direct_runner(ValueType::Int)?;
+        assert_eq!(runner.call::<i32>("EchoInt", 42_i32)?, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_initialization_errors_do_not_replace_an_existing_instance() -> Result<()> {
+        unsafe extern "C" fn invalid() {
+            unsafe {
+                hl_register_function_definition(c"Invalid".as_ptr(), None, 0, ptr::null(), 8)
+            };
+        }
+        let mut runner = direct_runner(ValueType::Int)?;
+        let error = unsafe { crate::InProcessRunnerBuilder::new(invalid).build() }
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("null guest callback"));
+        assert_eq!(runner.call::<i32>("EchoInt", 42_i32)?, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_instances_keep_distinct_guest_registries() -> Result<()> {
+        unsafe extern "C" fn only_alias() {
+            unsafe {
+                hl_register_function_definition(c"Alias".as_ptr(), Some(echo), 1, [0].as_ptr(), 0)
+            };
+        }
+        let mut first = direct_runner(ValueType::Int)?;
+        let mut second = unsafe { crate::InProcessRunnerBuilder::new(only_alias).build()? };
+        assert_eq!(second.functions().len(), 1);
+        assert_eq!(second.functions()[0].name, "Alias");
+        assert!(first.call::<i32>("Alias", 1_i32).is_err());
+        assert!(second.call::<i32>("EchoInt", 1_i32).is_err());
+        assert_eq!(first.call::<i32>("EchoInt", 42_i32)?, 42);
+        assert_eq!(second.call::<i32>("Alias", 7_i32)?, 7);
+        drop(first);
+        assert_eq!(second.call::<i32>("Alias", 8_i32)?, 8);
+        Ok(())
     }
 }

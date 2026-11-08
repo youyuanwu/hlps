@@ -7,10 +7,12 @@ statically linked guests on **Linux x86_64**. It contains:
 - Owned, Vercode-encoded call, result, error, and host-callback messages.
 - A synchronous Rust client that owns and reaps the runner subprocess.
 - A sandbox-style builder, typed guest calls, and registered typed host callbacks.
+- A thread-bound in-process runner using direct calls without IPC or serialization.
 
 **This is not Hyperlight's VM runtime or a security sandbox.** Native guest
 code has the process's filesystem, network, and syscall access. Invalid native
 pointers, crashes, or infinite loops cannot be safely contained by this adapter.
+In-process guest failures can corrupt or terminate the host itself.
 Only run trusted guests, or apply separate OS-level restrictions.
 
 ## Statically link a guest
@@ -65,7 +67,7 @@ The native API reuses `hyperlight-common`'s `ParameterTuple`,
 `SupportedParameterType`, and `SupportedReturnType` traits rather than
 maintaining a second set of type/tuple implementations. These are re-exported
 from `hyperlight_process::func`, together with `Bytes` for `Vec<Bytes>` byte chunks.
-The process still uses Vercode, not Hyperlight's FlatBuffers transport or VMM.
+Subprocess mode uses Vercode, not Hyperlight's FlatBuffers transport or VMM.
 
 Host callbacks accept `FnMut + Send + 'static` closures with individually typed
 arguments and either a plain return value or `anyhow::Result<T>`. Register them
@@ -91,7 +93,70 @@ and a child exiting during a call are errors; do not reuse that connection.
 Dropping the client terminates and reaps a remaining child. `shutdown` requests
 a clean exit and checks its status.
 
-## Protocol and ownership
+## Direct in-process execution
+
+Link the same native C static library into the host instead of a separate
+executable. Invocation is registration-driven and needs no per-function code
+generation. Both directions convert owned values to/from the same C ABI, with
+**no Vercode encoding, pipe I/O, subprocess, or VM**:
+
+```rust,no_run
+use hyperlight_process::InProcessRunnerBuilder;
+
+unsafe extern "C" {
+    fn hyperlight_main();
+}
+
+# fn main() -> anyhow::Result<()> {
+let mut runner = unsafe {
+    InProcessRunnerBuilder::new(hyperlight_main)
+        .host_function("HostLog", |message: String| {
+            println!("guest -> host: {message}");
+            Ok(true)
+        })
+        .build()?
+};
+let greeting = runner.call::<String>("Greet", "Hyperlight".to_owned())?;
+let sum = runner.call::<i64>("Add", (20_i32, 22_i32))?;
+# Ok(())
+# }
+```
+
+`build` is unsafe: the guest and its pointers must obey the C ABI for the
+runner's entire lifetime. The runner is neither `Send` nor `Sync`, so create,
+call, and drop it on its owning thread. Host callbacks have the same typed
+registration API as subprocess mode; `functions()` and `call_dynamic` are also
+available. There is no per-call `call_with` override in direct mode. Drop the
+runner to release adapter state; there is no child process to shut down.
+
+The shared runtime scopes C API thread-local state to each active instance.
+Registrations, host closures, errors, and result storage are instance-local.
+Native C globals, heap, and libc state are **not** isolated or reset: multiple
+instances linked to the same guest share its globals, and callers must prevent
+races. Linking distinct guests also requires distinct initializer/global
+symbols; the runner does not rename symbols or load libraries dynamically.
+
+Recursive native execution on a thread is rejected, including calls or
+construction of another direct runner from a host callback. Host callbacks
+become available after guest initialization, just as in subprocess mode.
+Ordinary guest/host errors leave direct instances usable. Rust host callback
+panics are caught before crossing the C ABI and make only that runner unusable.
+This requires panic unwinding; `panic=abort` still terminates the host.
+Invalid C memory access and guest abort APIs can terminate the entire host,
+and a hung guest cannot be safely interrupted by this library.
+
+Direct mode bypasses the subprocess 16 MiB frame limit, but still copies
+argument/return data for ownership and applies C ABI validation. It is not a
+zero-copy or sandboxed execution mode. The dependency still includes Vercode
+for the subprocess API, but direct execution never invokes its codec.
+
+Run the [direct C demo](../../samples/c-guest/native/src/bin/inprocess.rs):
+
+```sh
+CARGO_BUILD_JOBS=1 make -C samples/c-guest run-inprocess
+```
+
+## Subprocess protocol and shared ownership
 
 The protocol uses pinned **Vercode 0.7.0**, not raw C structs or Hyperlight's VM
 FlatBuffers transport. Each top-level message uses Vercode's little-endian
@@ -120,7 +185,8 @@ Use `hl_free_byte_chunks` for the byte-chunk getter's result.
 
 Protocol stdout is reserved exclusively for binary messages. Guests must use
 `HostLog`, `hl_log`, or stderr for logging; native `printf` to stdout corrupts
-the connection. Abort APIs log to stderr and terminate the subprocess.
+the connection. Direct mode does not reserve stdout. Abort APIs log to stderr
+and terminate the current process, including the host in direct mode.
 Guest callbacks and adapter API calls must execute on the runner's thread.
 IPC host callbacks are available only after the initialization handshake;
 attempting one during initialization reports an error without waiting for IPC.
@@ -138,4 +204,11 @@ From the repository root:
 ```sh
 CARGO_BUILD_JOBS=1 cargo test -p hyperlight-process -p hyperlight-c-guest-native --locked
 CARGO_BUILD_JOBS=1 make -C samples/c-guest run-native
+CARGO_BUILD_JOBS=1 make -C samples/c-guest run-inprocess
 ```
+
+Tests exercise all argument/return types and host getters through the shared
+C ABI in both modes, scoped state and reentrancy rejection, panic handling,
+and direct payloads larger than the IPC frame limit. Integration tests run the
+unmodified C sample's strings, callbacks, integer extremes, and error paths
+in subprocess and direct modes.

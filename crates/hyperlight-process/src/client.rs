@@ -1,14 +1,13 @@
-use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::func::{HostFunction, ParameterTuple, RegisteredHostFunction, SupportedReturnType};
+use crate::func::{HostFunction, HostFunctions, ParameterTuple, SupportedReturnType, guest_call};
 use crate::protocol::{
-    CallError, CallResult, FunctionCall, FunctionSignature, Message, PROTOCOL_VERSION, Value,
-    read_message, write_message,
+    CallResult, FunctionCall, FunctionSignature, Message, PROTOCOL_VERSION, Value, read_message,
+    write_message,
 };
 
 /// Configure a native executable and its typed host callbacks before spawning it.
@@ -31,8 +30,7 @@ use crate::protocol::{
 /// ```
 pub struct RunnerBuilder {
     command: Command,
-    host_functions: BTreeMap<String, RegisteredHostFunction>,
-    validation_error: Option<anyhow::Error>,
+    host_functions: HostFunctions,
 }
 
 impl RunnerBuilder {
@@ -44,8 +42,7 @@ impl RunnerBuilder {
     pub fn from_command(command: Command) -> Self {
         Self {
             command,
-            host_functions: BTreeMap::new(),
-            validation_error: None,
+            host_functions: HostFunctions::default(),
         }
     }
 
@@ -55,22 +52,12 @@ impl RunnerBuilder {
         name: impl AsRef<str>,
         function: impl Into<HostFunction<Output, Args>>,
     ) -> Self {
-        let name = name.as_ref();
-        if name.is_empty() || name.contains('\0') {
-            self.validation_error = Some(anyhow::anyhow!(
-                "host function name must be nonempty and contain no NUL"
-            ));
-        } else {
-            self.host_functions
-                .insert(name.to_owned(), function.into().into());
-        }
+        self.host_functions.register(name.as_ref(), function);
         self
     }
 
     pub fn build(mut self) -> Result<Runner> {
-        if let Some(error) = self.validation_error {
-            return Err(error);
-        }
+        self.host_functions.validate()?;
         let mut runner = Runner::spawn(&mut self.command)?;
         runner.host_functions = self.host_functions;
         Ok(runner)
@@ -83,7 +70,7 @@ pub struct Runner {
     input: Option<BufWriter<ChildStdin>>,
     output: BufReader<ChildStdout>,
     functions: Vec<FunctionSignature>,
-    host_functions: BTreeMap<String, RegisteredHostFunction>,
+    host_functions: HostFunctions,
     next_id: u64,
     usable: bool,
     reaped: bool,
@@ -104,7 +91,7 @@ impl Runner {
             input: Some(BufWriter::new(input)),
             output: BufReader::new(output),
             functions: Vec::new(),
-            host_functions: BTreeMap::new(),
+            host_functions: HostFunctions::default(),
             next_id: 1,
             usable: true,
             reaped: false,
@@ -135,15 +122,7 @@ impl Runner {
         function: &str,
         arguments: impl ParameterTuple,
     ) -> Result<Output> {
-        let value = self.call_dynamic(FunctionCall {
-            function: function.into(),
-            arguments: arguments
-                .into_value()
-                .into_iter()
-                .map(Value::from)
-                .collect(),
-            return_type: Output::TYPE.into(),
-        })?;
+        let value = self.call_dynamic(guest_call::<Output>(function, arguments))?;
         Output::from_value(value.into()).context("converting native guest return value")
     }
 
@@ -199,22 +178,7 @@ impl Runner {
                 Message::HostCall { id, call } => {
                     let result = match host_callback.as_deref_mut() {
                         Some(callback) => callback(&call),
-                        None => {
-                            let result = self
-                                .host_functions
-                                .get_mut(&call.function)
-                                .with_context(|| {
-                                    format!("unregistered host function: {}", call.function)
-                                })
-                                .and_then(|function| function.call(call));
-                            match result {
-                                Ok(value) => CallResult::Value(value),
-                                Err(error) => CallResult::Error(CallError {
-                                    code: 17,
-                                    message: format!("{error:#}"),
-                                }),
-                            }
-                        }
+                        None => self.host_functions.dispatch(call),
                     };
                     write_message(input, &Message::HostResult { id, result })?;
                 }

@@ -19,7 +19,7 @@ GUEST_CFLAGS := --target=x86_64-unknown-linux-none -U__linux__ \
 GUEST_LDFLAGS := -fuse-ld=lld -nostdlib -pie -Wl,-e,entrypoint \
 	-Wl,--no-dynamic-linker
 
-.PHONY: all guest host run native run-native test test-vm test-native clean
+.PHONY: all guest host run native run-native run-inprocess test test-vm test-native clean
 all: guest host
 
 sdk/library.tar.gz:
@@ -57,6 +57,9 @@ native: build/native-include/.ready
 
 run-native: native
 	"$(TARGET_DIR)/debug/hyperlight-c-guest-native-demo"
+
+run-inprocess: native
+	"$(TARGET_DIR)/debug/hyperlight-c-guest-inprocess-demo"
 
 build/native-include/.ready: sdk/.ready
 	mkdir -p build/native-include

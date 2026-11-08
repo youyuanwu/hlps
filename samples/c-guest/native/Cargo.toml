@@ -22,3 +22,7 @@ path = "src/main.rs"
 [[bin]]
 name = "hyperlight-c-guest-native-runner"
 path = "src/bin/runner.rs"
+
+[[bin]]
+name = "hyperlight-c-guest-inprocess-demo"
+path = "src/bin/inprocess.rs"
