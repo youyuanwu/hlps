@@ -77,7 +77,7 @@ def free_ports(*ports):
 
 
 @contextmanager
-def native(env):
+def native_server(env, cpu=None):
     free_ports(NATIVE_PORT)
     if (NATIVE_DATA / "postmaster.pid").exists():
         raise RuntimeError("native baseline has a live/stale lockfile; inspect before reuse")
@@ -91,12 +91,15 @@ def native(env):
                          + "\n" + phase3.PROFILE.read_text()
                          + f"\nport={NATIVE_PORT}\n")
     with (DATA / "native.log").open("wb") as log:
-        process = subprocess.Popen([str(phase2.NATIVE / "bin/postgres"), "-D", str(NATIVE_DATA)],
+        args = [str(phase2.NATIVE / "bin/postgres"), "-D", str(NATIVE_DATA)]
+        if cpu is not None:
+            args = ["taskset", "--cpu-list", str(cpu), *args]
+        started = time.perf_counter_ns()
+        process = subprocess.Popen(args,
                                    env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
             ready(process, NATIVE_PORT, env, log.name)
-            with phase2.Session("native", env, DATA, NATIVE_PORT) as session:
-                yield session
+            yield process, time.perf_counter_ns() - started
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)
@@ -113,6 +116,13 @@ def native(env):
                 raise RuntimeError("native baseline shutdown deadline exceeded") from error
             if code != 0:
                 raise RuntimeError(f"native baseline exited {code}; inspect {log.name}")
+
+
+@contextmanager
+def native(env):
+    with native_server(env):
+        with phase2.Session("native", env, DATA, NATIVE_PORT) as session:
+            yield session
 
 
 def expected_checksum():
@@ -201,12 +211,15 @@ def audit_snapshot(path, allow_partial=False):
 
 
 class VM:
-    def __init__(self, name, env):
+    def __init__(self, name, env, output=DATA, cpu=None, profile=None):
         self.name = name
         self.env = env
+        self.output = output
+        self.cpu = cpu
+        self.profile = profile
         self.identity = secrets.token_hex(16)
-        self.audit = DATA / f"{name}-audit-{self.identity}.jsonl"
-        self.log_path = DATA / f"{name}-guest.log"
+        self.audit = output / f"{name}-audit-{self.identity}.jsonl"
+        self.log_path = output / f"{name}-guest.log"
         self.process = None
         self.crashed = False
         self.peak_rss = 0
@@ -229,8 +242,12 @@ class VM:
     def __enter__(self):
         free_ports(phase2.PORT, phase2.CONTROL_PORT)
         self.log = self.log_path.open("wb")
+        args = [*phase3.command("/pg-init", self.audit, self.identity, self.cpu), str(FAULT)]
+        if self.profile is not None:
+            args.append(str(self.profile))
+        started = time.perf_counter_ns()
         self.process = subprocess.Popen(
-            [*phase3.command("/pg-init", self.audit, self.identity), str(FAULT)],
+            args,
             cwd=phase1.WORK, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 5
@@ -248,6 +265,7 @@ class VM:
             self.monitor = threading.Thread(target=self.sample)
             self.monitor.start()
             ready(self.process, phase2.PORT, self.env, self.log_path)
+            self.startup_ns = time.perf_counter_ns() - started
             generations = dsm_generations()
             if not generations or set(generations.values()) != {self.identity}:
                 raise RuntimeError("fresh VM retained stale DSM addresses/generations")
@@ -257,7 +275,7 @@ class VM:
             raise
 
     def session(self, suffix="sql"):
-        return phase2.Session(f"{self.name}-{suffix}", self.env, DATA)
+        return phase2.Session(f"{self.name}-{suffix}", self.env, self.output)
 
     def crash(self):
         self.done.set()

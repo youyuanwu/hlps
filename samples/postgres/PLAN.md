@@ -1,9 +1,10 @@
 # PostgreSQL on Hyperlight-Unikraft: experiment plan
 
-Status: **Phases 1-4 implemented and validated within their documented scope**.
+Status: **Phases 1-5 implemented and validated within their documented scope**.
 See [instructions and results](README.md). Disk spilling and fresh-VM recovery
 pass the bounded host-process/WAL-error gates; power-loss durability is not
-established. Phase 5 evaluation has not started.
+established. The minimal-profile native/guest evaluation is complete;
+optional feature expansion remains deferred. See [measured evaluation](RESULTS.md).
 Prepared 2026-11-08.
 
 ## Objective
@@ -317,6 +318,17 @@ Only after the persistent-storage gate:
 - Re-enable optional workers/features individually, with tests. No replication,
   broad Linux compatibility, or production claim follows from the minimal
   server passing.
+
+2026-11-08: the bounded evaluation passes with three rotating serial repeats
+per mode and a separate guest filesystem profile. A compiled libpq client
+checks exact results while timing startup/readiness, the first benchmark
+connection/query, warmed SQL, synchronous updates, and spill checksums.
+Servers are pinned to CPU 0 and clients to CPU 1; the exposed CPUs are sibling
+threads of one virtualized core. PSS, logical data/WAL size, real synchronization,
+and callback costs are recorded. The guest is substantially slower on hot
+queries and spilling; this is an audited development-build prototype, not an
+isolation-only overhead measurement. Optional features remain disabled.
+See [results, variability, and limitations](RESULTS.md).
 
 Snapshots are a separate follow-up. Before supporting them, define how files,
 locks, connections, WAL, clocks, and shared-memory descriptors behave at restore.

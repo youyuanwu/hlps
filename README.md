@@ -11,8 +11,9 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
   Criterion steady-state measurements, and lifecycle/per-call latency CSV.
 - [PostgreSQL experiment](samples/postgres/README.md): pinned Hyperlight-Unikraft
   baseline, PostgreSQL 16.15 server, host-backed synchronization, and measured
-  spill/fresh-VM recovery gates; [the plan](samples/postgres/PLAN.md) covers
-  the remaining evaluation.
+  spill/fresh-VM recovery gates, with a
+  [native/guest evaluation](samples/postgres/RESULTS.md) and
+  [experiment plan](samples/postgres/PLAN.md).
 
 ## Rust workspace
 

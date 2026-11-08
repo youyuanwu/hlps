@@ -459,9 +459,9 @@ fn bytes_in(root: &Path) -> io::Result<u64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if !(6..=7).contains(&args.len()) {
+    if !(6..=8).contains(&args.len()) {
         return Err(
-            "usage: postgres-storage ROOTFS STORAGE AUDIT ENTRY VM_ID [WAL_FAULT_CONTROL]".into(),
+            "usage: postgres-storage ROOTFS STORAGE AUDIT ENTRY VM_ID [WAL_FAULT_CONTROL [PROFILE_OUTPUT]]".into(),
         );
     }
     // Keep ownership in the VM host, not only its potentially short-lived launcher.
@@ -485,6 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.clean_stale_guest_lock()?;
     }
     let mut guest = SandboxBuilder::from_initrd(&args[1])
+        .profile(args.len() == 8)
         .scratch_mb(512)
         .entry(&args[4])
         .env("HL_PG_VM_ID", &args[5])
@@ -497,6 +498,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = guest.join()?;
     if status != 0 {
         return Err(format!("guest exited {status}").into());
+    }
+    if let Some(path) = args.get(7) {
+        let mut report = OpenOptions::new().write(true).create_new(true).open(path)?;
+        report.write_all(guest.profile().report().as_bytes())?;
     }
     drop(owner);
     Ok(())

@@ -153,9 +153,11 @@ def configure():
         write_storage_config()
 
 
-def command(entry, audit, identity):
+def command(entry, audit, identity, cpu=None):
     args = ["timeout", "--kill-after=5s", "120s", DATA / "storage-host",
             DATA / "postgres.cpio", STORAGE, audit, entry, identity]
+    if cpu is not None:
+        args = ["taskset", "--cpu-list", str(cpu), *args]
     if not (os.access("/dev/kvm", os.R_OK) and os.access("/dev/kvm", os.W_OK)):
         if not shutil.which("setpriv"):
             raise RuntimeError("setpriv is required to drop root before the persistent VM host")

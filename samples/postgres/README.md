@@ -7,6 +7,7 @@ or snapshots. Phase 2 uses authenticated loopback TCP and an initialized
 in-guest database. Phase 3 enables real host-backed synchronization; Phase 4
 measures disk spilling and fresh-VM recovery with SQL-time WAL errors.
 Power-loss durability and production readiness are not established.
+Phase 5's bounded native/guest comparison is documented in [RESULTS.md](RESULTS.md).
 
 ## Phase 1: build and run
 
@@ -506,4 +507,76 @@ though the client never received its commit acknowledgement. Applications
 must handle that ambiguity rather than blindly retrying a non-idempotent
 transaction. No power-off, global cache dropping, arbitrary torn writes,
 live snapshots, full POSIX descriptor semantics, or broad locking support
-is claimed. Phase 5 evaluation and optional features remain separate work.
+is claimed. Phase 5 below evaluates this minimal profile; optional features
+remain separate work.
+
+## Phase 5: native/guest evaluation
+
+With initialized persistent storage and the native/guest PostgreSQL tools:
+
+```sh
+make -C samples/postgres phase5
+# Repeat measurements against already built and recovery-validated inputs:
+make -C samples/postgres eval-test
+```
+
+`phase5` rebuilds only the required host/rootfs and
+[compiled libpq client](tests/query-client.c), runs helper tests and the current
+Phase 4 recovery gate, then invokes [phase5.py](phase5.py). `eval-test` refuses
+changed artifacts/configuration, a stale client build, unconsumed fault
+controls, or inputs without a current successful Phase 4 result. At least
+two allowed logical CPUs, `taskset`, and `findmnt` are required.
+
+The evaluation uses three serial rotating mode orders: native/guest,
+guest/native, native/guest. Every server process inherits CPU 0 affinity on
+this host, with the client and sampler on CPU 1; on another host it uses the
+first two allowed CPUs. The CPUs here are sibling threads, not two independent
+cores. Affinity is process-local and the invoking thread's original allowance
+is restored on success or failure. No server modes run concurrently.
+
+Both modes use unmodified native PostgreSQL 16.15 tools and the same
+deterministic 100,000-row fixture/configuration. The guest retains the existing
+target-guarded server patches. The benchmark recreates `spill_fixture` and
+`eval_commits`, adds a unique ID index, and performs EXPLAIN/checkpoint
+preparation outside timing. It never initializes or erases existing PGDATA.
+
+Per repeat, the client measures:
+
+- One authenticated benchmark connection and its first `SELECT 1`, after
+  preparation; these are not cold-cache/first-ever database connections.
+- 1,000 warmed `SELECT 1` calls and 1,000 deterministic indexed lookups.
+- 300 synchronous autocommit updates with exact returned counters.
+- Five full ordered-result spill checksums, matching the independent
+  Phase 4 expectation and native results.
+
+Each short workload has 50 untimed warm-up calls; spilling has one. `PQexec`
+round-trip timing excludes result validation and CSV output. Separate batch
+timing includes loop/result-validation overhead but excludes CSV writing, so
+reported throughput is measured single-client closed-loop throughput, not
+`1 / median latency` or a concurrent-load capacity claim.
+
+Native server-tree and guest-host proportional set size (PSS) are sampled
+every 50 ms while preparation/SQL runs, capped at 1 GiB. Summed RSS is also
+recorded but double-counts native shared pages. Existing scratch, storage,
+SQL, readiness, client, and shutdown deadlines stay bounded; the client has
+a 90-second host deadline and each guest VM 120 seconds.
+
+Main latency runs explicitly disable Hyperlight-Unikraft profiling but retain
+the Phase 3 host audit and quota enforcement. A separate reduced guest run
+enables the existing upstream profiler and writes its report only after clean
+VM shutdown. It reports filesystem callback counts/body time, including
+backend/accounting/audit work, **not** isolated VM transition overhead.
+
+**Evaluation passed**: 13,830 timed workload queries across six main runs,
+plus the separate profiled diagnostic, exact SQL/CSV checks, spill cleanup,
+CPU/memory/storage checks, 25 Python tests, seven targeted Rust tests, and
+Clippy with warnings denied. The default Phase 3 host and Phase 4 recovery
+gates still pass. No PostgreSQL compatibility patch or optional worker was
+added for evaluation.
+
+See [RESULTS.md](RESULTS.md) for every measured workload, startup/memory/disk
+figures, variability, build differences, and the experimental go/no-go
+decision. Raw per-query CSVs, EXPLAIN JSON, logs, profiles, binaries, credentials,
+and versioned result metadata remain ignored under
+`target/postgres-experiment/phase5/`; initialization/data and credentials are
+reused only from this dedicated experiment. No server is left running.
