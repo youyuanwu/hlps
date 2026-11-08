@@ -1,66 +1,72 @@
 .NOTPARALLEL:
-.PHONY: preflight fetch build test-native test-guest check phase1 phase2 pg-kernel pg-native pg-guest pg-package pg-test phase3 storage-build storage-package storage-init storage-config storage-test phase4 recovery-test phase5 eval-build eval-test
+.PHONY: setup preflight fetch runtime-build process-test-native process-test-guest process-test check pg-kernel pg-native pg-guest pg-package sql-test ram-demo storage-build storage-package storage-init storage-config storage-test persistent-demo recovery-test benchmark-build benchmark validate
 
-preflight fetch build test-native test-guest:
-	python3 phase1.py $@
+setup:
+	$(MAKE) preflight fetch pg-native pg-guest storage-build storage-package storage-init check
+
+preflight fetch:
+	python3 runtime.py $@
+
+runtime-build:
+	python3 runtime.py build
+
+process-test-native:
+	python3 runtime.py test-native
+
+process-test-guest:
+	python3 runtime.py test-guest
 
 check:
 	python3 -m unittest discover -s tests -p 'test_*.py'
 
-phase1:
-	$(MAKE) preflight
-	$(MAKE) fetch
-	$(MAKE) build
-	$(MAKE) check test-native test-guest
+process-test:
+	$(MAKE) preflight fetch runtime-build check process-test-native process-test-guest
 
 pg-kernel:
-	python3 phase2.py kernel
+	python3 postgres.py kernel
 
 pg-native:
-	python3 phase2.py build-native
+	python3 postgres.py build-native
 
 pg-guest:
-	python3 phase2.py build-guest
+	python3 postgres.py build-guest
 
 pg-package:
-	python3 phase2.py package
+	python3 postgres.py package
 
-pg-test:
-	python3 phase2.py test
+sql-test:
+	python3 postgres.py test
 
-phase2:
+ram-demo:
 	$(MAKE) preflight fetch
-	$(MAKE) pg-kernel pg-native pg-guest pg-package check pg-test
+	$(MAKE) pg-kernel pg-native pg-guest pg-package check sql-test
 
 storage-build:
-	python3 phase3.py build
+	python3 storage.py build
 
 storage-package:
-	python3 phase3.py package
+	python3 storage.py package
 
 storage-init:
-	python3 phase3.py init
+	python3 storage.py init
 
 storage-config:
-	python3 phase3.py configure
+	python3 storage.py configure
 
 storage-test:
-	python3 phase3.py test
+	python3 storage.py test
 
-phase3:
+persistent-demo:
 	$(MAKE) preflight fetch storage-build storage-package storage-config check storage-test
 
 recovery-test:
-	python3 phase4.py test
+	python3 recovery.py test
 
-phase4:
-	$(MAKE) preflight fetch storage-build storage-package check storage-test recovery-test
+benchmark-build:
+	python3 evaluate.py build
 
-eval-build:
-	python3 phase5.py build
+benchmark:
+	python3 evaluate.py test
 
-eval-test:
-	python3 phase5.py test
-
-phase5:
-	$(MAKE) preflight fetch storage-build storage-package eval-build check recovery-test eval-test
+validate:
+	$(MAKE) process-test ram-demo persistent-demo recovery-test benchmark-build benchmark

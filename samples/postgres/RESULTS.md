@@ -4,7 +4,7 @@
 PostgreSQL 16.15 and the Hyperlight-Unikraft guest, plus a separate profiled
 guest run. The persistent-storage/recovery prerequisite also passed.
 
-## Summary and decision
+## Demonstrated results
 
 - Median warmed `SELECT 1`: **49.8 us native / 411.3 us guest**, about 8.3x.
 - Median indexed lookup: **64.6 us / 685.8 us**, about 10.6x.
@@ -13,10 +13,10 @@ guest run. The persistent-storage/recovery prerequisite also passed.
 - Sampled server-tree PSS: **51.1 MiB native / 135.9 MiB guest**.
 - Filesystem callback body time is dominated by writes in the diagnostic.
 
-**Go for further bounded prototype research; not a production readiness
-decision.** Real PostgreSQL SQL, disk spilling, synchronization, and fresh-VM
-recovery work within the tested limits. The current audited development-build
-storage path is expensive, especially for spilling. Optional features,
+**The sample successfully executes real PostgreSQL SQL, disk spilling,
+synchronization, and fresh-VM recovery within the tested limits.** The current
+audited development-build storage path is expensive, especially for spilling.
+These results are not a production readiness certification. Optional features,
 snapshots, full POSIX descriptor/locking semantics, and physical power-loss
 durability remain unvalidated or unsupported.
 
@@ -190,17 +190,19 @@ native latency nor this profile isolates pure Hyperlight overhead.
 
 ## Reproducibility and remaining limits
 
-Run [the documented targets](README.md#phase-5-nativeguest-evaluation).
+Run [the documented benchmark targets](README.md#performance).
 The successful raw run is
 `target/postgres-experiment/phase5/20261108T181403.037139Z/`, with per-query
 CSVs, EXPLAIN JSON, logs, diagnostic profile, and versioned `results.json`.
-The top-level Phase 5 result records current script/client/host/rootfs/native
+The top-level benchmark result records current script/client/host/rootfs/native
 tool hashes and exact source pins; generated artifacts and credentials remain
 ignored. No PostgreSQL compatibility patch was added for evaluation.
 
-Validation: **25 Python tests, seven targeted Rust tests, C compilation with
-warnings denied, Clippy with warnings denied**, default Phase 3 storage gate,
-and Phase 4's SQL-time WAL faults/fresh-VM recovery gate. No server or storage
+Validation for this measured run: **25 Python tests, seven targeted Rust tests,
+C compilation with warnings denied, Clippy with warnings denied**, persistent
+storage/SQL validation, and SQL-time WAL faults/fresh-VM recovery. These checks
+are retained under the descriptive scripts and targets in the sample README.
+No server or storage
 ownership lock is deliberately left held afterward.
 
 Recovery evidence is limited to owned-host SIGKILL and injected WAL write/
@@ -208,4 +210,4 @@ sync EIO/EDQUOT with the host OS page cache intact. A failed sync can leave an
 unacknowledged transaction recoverable: applications must handle the unknown
 commit outcome. This is not physical power-loss, torn-write, production,
 replication, SMP, or live-snapshot validation. Keep optional features disabled
-until each has its own correctness/resource gate.
+in the validated configuration.

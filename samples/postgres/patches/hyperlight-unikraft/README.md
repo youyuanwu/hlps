@@ -1,7 +1,7 @@
 # Host filesystem patch
 
 Base: Hyperlight-Unikraft `155d333bad549377e8026a596ce89c0d4cd8e9ef`.
-Locally authored for Phase 3; not submitted upstream. The affected Apache-2.0
+Locally authored for the persistent storage backend; not submitted upstream. The affected Apache-2.0
 copyright/license notices remain in the pinned source.
 
 [series](series) adds:

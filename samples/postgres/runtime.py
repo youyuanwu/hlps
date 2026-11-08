@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinned, single-job Linux/KVM baseline; no PostgreSQL server build."""
+"""Pinned runtime builds and native/KVM process validation."""
 
 import argparse
 import fcntl
@@ -39,7 +39,7 @@ def pins():
 
 
 def build_inputs():
-    paths = [HERE / "sources.toml", HERE / "phase1.py", HERE / "Makefile", HERE / "tests/process.c",
+    paths = [HERE / "sources.toml", HERE / "runtime.py", HERE / "Makefile", HERE / "tests/process.c",
              UPSTREAM / "defconfig-elfloader", UPSTREAM / "Cargo.lock"]
     for name in PATCH_TARGETS:
         paths.extend(patch_files(name))
@@ -55,7 +55,7 @@ def write_json(path, value):
 
 def preflight():
     if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise RuntimeError("Phase 1 requires Linux x86_64")
+        raise RuntimeError("The PostgreSQL sample requires Linux x86_64")
     required = ("git", "curl", "make", "gcc", "musl-gcc", "flex", "bison",
                 "m4", "cpio", "cargo", "rustc", "readelf", "timeout")
     missing = [tool for tool in required if not shutil.which(tool)]
@@ -308,7 +308,7 @@ def test(guest):
         prepare_patches()
         metadata = json.loads((WORK / "build.json").read_text())
         if metadata["inputs"] != build_inputs():
-            raise RuntimeError("Build inputs changed; run make build before guest tests")
+            raise RuntimeError("Build inputs changed; run make runtime-build before guest tests")
         for key, path in (("kernel_sha256", WORK / "kernel-build/elfloader_hyperlight-x86_64"),
                           ("embedded_kernel_sha256", UPSTREAM / "kernel/elfloader_hyperlight-x86_64"),
                           ("cli_sha256", WORK / "cargo/debug/hluk"),
@@ -350,7 +350,7 @@ def main():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError("Another phase1 command is running") from error
+            raise RuntimeError("Another runtime command is running") from error
         if command.startswith("test-"):
             test(command == "test-guest")
         else:

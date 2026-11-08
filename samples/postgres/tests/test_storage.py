@@ -6,38 +6,38 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import phase3
+import storage
 
 
 class StorageTests(unittest.TestCase):
     def test_writer_lock_rejects_aliases_and_is_released(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            storage = root / "storage"
-            storage.mkdir()
+            directory = root / "storage"
+            directory.mkdir()
             alias = root / "alias"
-            alias.symlink_to(storage)
-            with phase3.ownership(storage):
+            alias.symlink_to(directory)
+            with storage.ownership(directory):
                 with self.assertRaises(RuntimeError):
-                    with phase3.ownership(alias):
+                    with storage.ownership(alias):
                         pass
                 code = ("import sys; from pathlib import Path; "
-                        f"sys.path.insert(0, {str(phase3.HERE)!r}); import phase3; "
-                        f"ctx=phase3.ownership(Path({str(alias)!r})); ctx.__enter__()")
+                        f"sys.path.insert(0, {str(storage.HERE)!r}); import storage; "
+                        f"ctx=storage.ownership(Path({str(alias)!r})); ctx.__enter__()")
                 denied = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
                 self.assertNotEqual(denied.returncode, 0)
                 self.assertIn("already owned", denied.stderr)
-            with phase3.ownership(storage):
+            with storage.ownership(directory):
                 pass
 
     def test_postgres_needs_observed_wal_and_directory_sync(self):
         rows = [{"operation": "sync_all", "path": "pgdata/pg_wal/segment", "ok": True},
                 {"operation": "sync_all", "path": "pgdata/pg_logical", "ok": True}]
-        phase3.validate_audit(rows, True)
+        storage.validate_audit(rows, True)
         for values in ([], rows[:1], rows[1:],
                        [dict(row, ok=False) for row in rows]):
             with self.assertRaises(RuntimeError):
-                phase3.validate_audit(values, True)
+                storage.validate_audit(values, True)
 
     def test_directory_requires_multiple_successful_pages(self):
         rows = [{"operation": op, "path": path, "ok": ok} for op, path, ok in (
@@ -49,31 +49,31 @@ class StorageTests(unittest.TestCase):
             ("write", "probes/partial-write", False),
             ("write", "probes/quota", False))]
         pages = [{"operation": "list_page", "path": "probes/many", "ok": True}] * 40
-        phase3.validate_audit(rows + pages, False)
+        storage.validate_audit(rows + pages, False)
         with self.assertRaises(RuntimeError):
-            phase3.validate_audit(rows + pages[:39], False)
+            storage.validate_audit(rows + pages[:39], False)
         with self.assertRaises(RuntimeError):
-            phase3.validate_audit(rows + [dict(row, ok=False) for row in pages], False)
+            storage.validate_audit(rows + [dict(row, ok=False) for row in pages], False)
 
     def test_initialization_never_overwrites_existing_storage(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(phase3, "STORAGE", Path(temporary)):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(storage, "STORAGE", Path(temporary)):
             with self.assertRaisesRegex(RuntimeError, "never overwrite"):
-                phase3.initialize()
+                storage.initialize()
 
     def test_budget_scan_surfaces_permission_errors(self):
         error = PermissionError("unreadable database subdirectory")
         def unreadable(*_, onerror, **__):
             onerror(error)
             return iter(())
-        with patch.object(phase3.phase2.os, "walk", unreadable):
+        with patch.object(storage.postgres.os, "walk", unreadable):
             with self.assertRaises(PermissionError):
-                phase3.phase2.bytes_in(Path("/example"))
+                storage.postgres.bytes_in(Path("/example"))
 
     def test_budget_does_not_follow_rootfs_symlinks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "link").symlink_to("/missing")
-            self.assertEqual(phase3.phase2.bytes_in(root), len("/missing"))
+            self.assertEqual(storage.postgres.bytes_in(root), len("/missing"))
 
 
 if __name__ == "__main__":

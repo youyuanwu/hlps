@@ -21,20 +21,20 @@ and client tools are built from a separate, unmodified source tree.
 | 0002 | Anonymous main shared memory in one address space, validated child header, child detach without unmapping, and target-only mmap GUC support under EXEC_BACKEND. Replaces the reference's `no-sysv-ipc.patch` ENOSYS fallback. |
 | 0003 | DSM descriptors name anonymous mappings; attach validates a per-VM generation; detach preserves other users; destroy resolves even mappings not attached by its caller. Inspired by `dsm-single-address-space.patch`, with additional lifetime, bounds, and error handling. |
 
-The reference `allow-root.patch` is **not used**. The Phase 2 kernel profile
+The reference `allow-root.patch` is **not used**. The guest kernel profile
 sets a fixed uid/gid 1000; PostgreSQL's own root and data-directory ownership
 checks remain intact. Executable-path reuse assumes the tested fixed package
 is not upgraded or replaced during its VM lifetime; it is not a general
 replacement for PostgreSQL's installation/version check.
 
-Scope: one fresh VM and exclusive host experiment ownership, RAM-only data in
-Phase 2 or the bounded host-backed storage/recovery gates in Phases 3-4, and no
+Scope: one fresh VM and exclusive host experiment ownership, the RAM-backed SQL
+demo or bounded host-backed storage/recovery validation, and no
 warm snapshots. Raw address descriptors are invalid for another VM generation.
 A stale data-directory shared-memory interlock is a fatal error, not a
 successful "unused" result. The persistent host removes only recognized stale
 guest lockfiles while exclusively owning storage. PostgreSQL's existing mmap
 DSM startup cleanup removes old descriptors without attaching their addresses;
-Phase 4 verifies fresh identities across actual crashes. This is not a
+[Recovery tests](../../recovery.py) verify fresh identities across actual crashes. This is not a
 production PostgreSQL replacement on Linux or a power-loss durability proof.
 
 The SQL gate validates required auxiliary processes, independent concurrent

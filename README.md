@@ -12,8 +12,8 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
 - [PostgreSQL experiment](samples/postgres/README.md): pinned Hyperlight-Unikraft
   baseline, PostgreSQL 16.15 server, host-backed synchronization, and measured
   spill/fresh-VM recovery gates, with a
-  [native/guest evaluation](samples/postgres/RESULTS.md) and
-  [experiment plan](samples/postgres/PLAN.md).
+  [native/guest performance results](samples/postgres/RESULTS.md) and
+  reproducible validation suites.
 
 ## Rust workspace
 

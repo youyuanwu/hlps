@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measured spill, fresh-VM recovery, and one-shot WAL failure gates."""
+"""Disk spilling, fresh-VM recovery, and SQL-time WAL failure validation."""
 
 import argparse
 from contextlib import contextmanager
@@ -17,11 +17,11 @@ import sys
 import threading
 import time
 
-import phase1
-import phase2
-import phase3
+import runtime
+import postgres
+import storage
 
-DATA = phase1.WORK / "phase4"
+DATA = runtime.WORK / "phase4"
 NATIVE_DATA = DATA / "native-pgdata"
 NATIVE_PORT = 55434
 FAULT = DATA / "wal-fault.json"
@@ -41,15 +41,15 @@ CHECKSUM = (
 
 def environment():
     pgpass = DATA / "pgpass"
-    pgpass.write_text(f"127.0.0.1:*:postgres:phase2:{(phase3.DATA / 'password').read_text().strip()}\n")
+    pgpass.write_text(f"127.0.0.1:*:postgres:phase2:{(storage.DATA / 'password').read_text().strip()}\n")
     pgpass.chmod(0o600)
     env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
     env.update(PGPASSFILE=str(pgpass), PGCONNECT_TIMEOUT="2", PGAPPNAME="phase4")
     return env
 
 
-def psql_args(port=phase2.PORT):
-    return list(map(str, [phase2.NATIVE / "bin/psql", "-X", "-At", "-v", "ON_ERROR_STOP=1",
+def psql_args(port=postgres.PORT):
+    return list(map(str, [postgres.NATIVE / "bin/psql", "-X", "-At", "-v", "ON_ERROR_STOP=1",
                          "-h", "127.0.0.1", "-p", port, "-U", "phase2", "-d", "postgres"]))
 
 
@@ -59,7 +59,7 @@ def ready(process, port, env, log):
         if process.poll() is not None:
             raise RuntimeError(f"server exited {process.returncode}; inspect {log}")
         check = subprocess.run(
-            list(map(str, [phase2.NATIVE / "bin/pg_isready", "-h", "127.0.0.1",
+            list(map(str, [postgres.NATIVE / "bin/pg_isready", "-h", "127.0.0.1",
                            "-p", port, "-U", "phase2", "-d", "postgres", "-t", "1"])),
             env=env, capture_output=True, timeout=3)
         if check.returncode == 0:
@@ -82,16 +82,16 @@ def native_server(env, cpu=None):
     if (NATIVE_DATA / "postmaster.pid").exists():
         raise RuntimeError("native baseline has a live/stale lockfile; inspect before reuse")
     if not NATIVE_DATA.exists():
-        phase1.run(["timeout", "--kill-after=5s", "60s", phase2.NATIVE / "bin/initdb",
+        runtime.run(["timeout", "--kill-after=5s", "60s", postgres.NATIVE / "bin/initdb",
                     "-D", NATIVE_DATA, "--username=phase2", "--encoding=UTF8", "--locale=C",
                     "--auth-local=reject", "--auth-host=scram-sha-256",
-                    f"--pwfile={phase3.DATA / 'password'}"])
+                    f"--pwfile={storage.DATA / 'password'}"])
         with (NATIVE_DATA / "postgresql.conf").open("a") as config:
-            config.write("\n" + (phase1.HERE / "rootfs/ram-only.conf").read_text()
-                         + "\n" + phase3.PROFILE.read_text()
+            config.write("\n" + (runtime.HERE / "rootfs/ram-only.conf").read_text()
+                         + "\n" + storage.PROFILE.read_text()
                          + f"\nport={NATIVE_PORT}\n")
     with (DATA / "native.log").open("wb") as log:
-        args = [str(phase2.NATIVE / "bin/postgres"), "-D", str(NATIVE_DATA)]
+        args = [str(postgres.NATIVE / "bin/postgres"), "-D", str(NATIVE_DATA)]
         if cpu is not None:
             args = ["taskset", "--cpu-list", str(cpu), *args]
         started = time.perf_counter_ns()
@@ -106,7 +106,7 @@ def native_server(env, cpu=None):
             try:
                 code = process.wait(timeout=15)
             except subprocess.TimeoutExpired as error:
-                for pid in reversed(phase2.descendants(process.pid)):
+                for pid in reversed(postgres.descendants(process.pid)):
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -121,7 +121,7 @@ def native_server(env, cpu=None):
 @contextmanager
 def native(env):
     with native_server(env):
-        with phase2.Session("native", env, DATA, NATIVE_PORT) as session:
+        with postgres.Session("native", env, DATA, NATIVE_PORT) as session:
             yield session
 
 
@@ -158,16 +158,16 @@ def validate_spill(plan):
 def spill(session, name, expected):
     for setting, value in (("fsync", "on"), ("synchronous_commit", "on"),
                            ("wal_sync_method", "fsync"), ("block_size", "8192")):
-        phase2.expect(session, f"SHOW {setting};", [value])
+        postgres.expect(session, f"SHOW {setting};", [value])
     session.execute("SET work_mem='64kB'; " + FIXTURE, timeout=60)
     plan = json.loads("\n".join(session.execute(
         "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + ORDERED + ";", timeout=60)))
-    phase1.write_json(DATA / f"{name}-explain.json", plan)
+    runtime.write_json(DATA / f"{name}-explain.json", plan)
     evidence = validate_spill(plan)
     checksum = session.execute(CHECKSUM, timeout=60)
     if checksum != [expected]:
         raise RuntimeError(f"{name} ordered-result checksum mismatch: {checksum}")
-    phase2.expect(session, "SELECT count(*),min(id),max(id),"
+    postgres.expect(session, "SELECT count(*),min(id),max(id),"
                   "count(*) FILTER (WHERE value != repeat(md5(id::text),4)) FROM spill_fixture;",
                   [f"{ROWS}|1|{ROWS}|0"])
     evidence.update(rows=ROWS, ordered_checksum=checksum[0])
@@ -186,7 +186,7 @@ def temp_files(root):
 
 def dsm_generations():
     found = {}
-    for path in sorted((phase3.STORAGE / "pgdata/pg_dynshmem").iterdir()):
+    for path in sorted((storage.STORAGE / "pgdata/pg_dynshmem").iterdir()):
         if not path.name.startswith("mmap."):
             raise RuntimeError(f"unexpected DSM entry: {path}")
         metadata = path.lstat()
@@ -229,7 +229,7 @@ class VM:
     def sample(self):
         try:
             while not self.done.wait(0.1):
-                self.peak_rss = max(self.peak_rss, phase2.rss_kib(self.host_pid))
+                self.peak_rss = max(self.peak_rss, postgres.rss_kib(self.host_pid))
                 if self.peak_rss > RSS_LIMIT:
                     raise RuntimeError("VM host exceeded the 1 GiB RSS test limit")
         except FileNotFoundError:
@@ -240,31 +240,31 @@ class VM:
             os.kill(self.host_pid, signal.SIGKILL)
 
     def __enter__(self):
-        free_ports(phase2.PORT, phase2.CONTROL_PORT)
+        free_ports(postgres.PORT, postgres.CONTROL_PORT)
         self.log = self.log_path.open("wb")
-        args = [*phase3.command("/pg-init", self.audit, self.identity, self.cpu), str(FAULT)]
+        args = [*storage.command("/pg-init", self.audit, self.identity, self.cpu), str(FAULT)]
         if self.profile is not None:
             args.append(str(self.profile))
         started = time.perf_counter_ns()
         self.process = subprocess.Popen(
             args,
-            cwd=phase1.WORK, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT)
+            cwd=runtime.WORK, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 5
             while True:
-                matches = [pid for pid in [self.process.pid, *phase2.descendants(self.process.pid)]
+                matches = [pid for pid in [self.process.pid, *postgres.descendants(self.process.pid)]
                            if Path(f"/proc/{pid}/exe").exists()
-                           and Path(f"/proc/{pid}/exe").resolve() == phase3.DATA / "storage-host"]
+                           and Path(f"/proc/{pid}/exe").resolve() == storage.DATA / "storage-host"]
                 if len(matches) == 1:
                     break
                 if len(matches) > 1 or self.process.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError(f"cannot identify the single owned storage VM host; inspect {self.log_path}")
                 time.sleep(0.01)
             self.host_pid = matches[0]
-            self.peak_rss = phase2.rss_kib(self.host_pid)
+            self.peak_rss = postgres.rss_kib(self.host_pid)
             self.monitor = threading.Thread(target=self.sample)
             self.monitor.start()
-            ready(self.process, phase2.PORT, self.env, self.log_path)
+            ready(self.process, postgres.PORT, self.env, self.log_path)
             self.startup_ns = time.perf_counter_ns() - started
             generations = dsm_generations()
             if not generations or set(generations.values()) != {self.identity}:
@@ -275,7 +275,7 @@ class VM:
             raise
 
     def session(self, suffix="sql"):
-        return phase2.Session(f"{self.name}-{suffix}", self.env, self.output)
+        return postgres.Session(f"{self.name}-{suffix}", self.env, self.output)
 
     def crash(self):
         self.done.set()
@@ -285,8 +285,8 @@ class VM:
         self.process.wait(timeout=5)
         if self.process.returncode == 0:
             raise RuntimeError("owned SIGKILL unexpectedly reported successful host exit")
-        with phase3.ownership(phase3.STORAGE):
-            if not (phase3.STORAGE / "pgdata/postmaster.pid").exists():
+        with storage.ownership(storage.STORAGE):
+            if not (storage.STORAGE / "pgdata/postmaster.pid").exists():
                 raise RuntimeError("owned-host crash did not leave the expected postmaster lockfile")
             stale = dsm_generations()
             if not stale or set(stale.values()) != {self.identity}:
@@ -300,23 +300,23 @@ class VM:
             self.monitor.join(timeout=2)
         try:
             if not self.crashed:
-                code = phase2.stop_guest(self.process, self.identity)
-                phase1.validate_result("postmaster-shutdown", self.log_path.read_text(), code)
+                code = postgres.stop_guest(self.process, self.identity)
+                runtime.validate_result("postmaster-shutdown", self.log_path.read_text(), code)
             if self.monitor_error:
                 raise RuntimeError(self.monitor_error)
         finally:
             self.log.close()
-        with phase3.ownership(phase3.STORAGE):
-            used = phase2.bytes_in(phase3.STORAGE)
+        with storage.ownership(storage.STORAGE):
+            used = postgres.bytes_in(storage.STORAGE)
         rows, tail = audit_snapshot(self.audit, allow_partial=self.crashed)
         peak_storage = max([used, *(r["storage_bytes"] for r in rows)])
-        if peak_storage > phase2.BUDGET:
+        if peak_storage > postgres.BUDGET:
             raise RuntimeError("VM storage exceeded the 512 MiB budget")
         self.result = {"audit": str(self.audit), "peak_host_rss_kib": self.peak_rss,
                        "peak_storage_bytes": peak_storage, "final_storage_bytes": used,
                        "successful_syncs": sum(r["ok"] and r["operation"].startswith("sync") for r in rows),
                        "interrupted_audit_tail_bytes": tail}
-        if not self.crashed and (phase3.STORAGE / "pgdata/postmaster.pid").exists():
+        if not self.crashed and (storage.STORAGE / "pgdata/postmaster.pid").exists():
             raise RuntimeError("clean VM shutdown left a postmaster lockfile")
 
 
@@ -325,9 +325,9 @@ def lifecycle(vm):
         victim = vm.session("victim")
         try:
             victim.execute("BEGIN; INSERT INTO recovery_gate VALUES (901);")
-            phase2.expect(observer, "SELECT count(*) FROM recovery_gate WHERE id=901;", ["0"])
+            postgres.expect(observer, "SELECT count(*) FROM recovery_gate WHERE id=901;", ["0"])
             pid = int(victim.execute("SELECT pg_backend_pid();")[0])
-            phase2.expect(observer, f"SELECT pg_terminate_backend({pid},5000);", ["t"])
+            postgres.expect(observer, f"SELECT pg_terminate_backend({pid},5000);", ["t"])
             try:
                 victim.execute("SELECT 1;")
             except RuntimeError as error:
@@ -339,24 +339,24 @@ def lifecycle(vm):
                 raise RuntimeError("backend termination was not explicitly reported to the client")
         finally:
             victim.disconnect()
-        phase2.expect(observer, "SELECT count(*) FROM recovery_gate WHERE id=901;", ["0"])
+        postgres.expect(observer, "SELECT count(*) FROM recovery_gate WHERE id=901;", ["0"])
         for i in range(12):
             with vm.session(f"reconnect-{i}") as client:
-                phase2.expect(client, "SELECT count(*) FROM recovery_gate;", ["8"])
+                postgres.expect(client, "SELECT count(*) FROM recovery_gate;", ["8"])
         disconnected = vm.session("disconnect")
         try:
             disconnected.execute("BEGIN; INSERT INTO recovery_gate VALUES (902);")
         finally:
             disconnected.disconnect()
         with vm.session("after-disconnect") as client:
-            phase2.expect(client, "SELECT count(*) FROM recovery_gate WHERE id=902;", ["0"])
+            postgres.expect(client, "SELECT count(*) FROM recovery_gate WHERE id=902;", ["0"])
     return {"reconnects": 12, "backend_termination_rollback": True, "disconnect_rollback": True}
 
 
 def assert_recovered(vm, expected, stale=None, commits=16, require_redo=True):
     with vm.session() as session:
-        phase2.expect(session, "SELECT id FROM recovery_gate ORDER BY id;", list(map(str, range(1, commits + 1))))
-        phase2.expect(session, "SELECT pg_is_in_recovery();", ["f"])
+        postgres.expect(session, "SELECT id FROM recovery_gate ORDER BY id;", list(map(str, range(1, commits + 1))))
+        postgres.expect(session, "SELECT pg_is_in_recovery();", ["f"])
         if session.execute(CHECKSUM, timeout=60) != [expected]:
             raise RuntimeError("spill fixture changed across a fresh VM restart")
     if stale is not None:
@@ -384,7 +384,7 @@ def fault_test(operation, env, expected, results):
         with vm.session("prepare") as session:
             session.execute("CHECKPOINT;")
         temporary = FAULT.with_suffix(".new")
-        phase1.write_json(temporary, {"operation": operation})
+        runtime.write_json(temporary, {"operation": operation})
         temporary.replace(FAULT)
         failed = subprocess.run(
             [*psql_args(), "-c", f"BEGIN; INSERT INTO fault_gate VALUES ('{operation}'); COMMIT;"],
@@ -417,29 +417,29 @@ def fault_test(operation, env, expected, results):
 
 
 def test():
-    phase3.verify()
-    phase2.verify_postgres_install(False)
-    meta = json.loads((phase3.DATA / "storage.json").read_text())
-    for field, path in (("config_sha256", phase3.STORAGE / "pgdata/postgresql.conf"),
-                        ("hba_sha256", phase3.STORAGE / "pgdata/pg_hba.conf"),
-                        ("profile_sha256", phase3.PROFILE)):
-        if meta.get(field) != phase1.digest(path):
+    storage.verify()
+    postgres.verify_postgres_install(False)
+    meta = json.loads((storage.DATA / "storage.json").read_text())
+    for field, path in (("config_sha256", storage.STORAGE / "pgdata/postgresql.conf"),
+                        ("hba_sha256", storage.STORAGE / "pgdata/pg_hba.conf"),
+                        ("profile_sha256", storage.PROFILE)):
+        if meta.get(field) != runtime.digest(path):
             raise RuntimeError("persistent configuration changed; run storage-config")
     if FAULT.exists() or FAULT.with_suffix(".new").exists():
         raise RuntimeError("unconsumed WAL fault control; inspect before restarting")
     result = {"status": "running", "fsync": True, "fault_model": "owned process SIGKILL; one-shot WAL EIO/EDQUOT"}
-    phase1.write_json(DATA / "results.json", result)
+    runtime.write_json(DATA / "results.json", result)
     env = environment()
     expected = expected_checksum()
     try:
         with native(env) as session:
             result["native_spill"] = spill(session, "native", expected)
-        if temp_files(NATIVE_DATA) or phase2.bytes_in(NATIVE_DATA) > phase2.BUDGET:
+        if temp_files(NATIVE_DATA) or postgres.bytes_in(NATIVE_DATA) > postgres.BUDGET:
             raise RuntimeError("native spill left temp files or exceeded storage budget")
         with VM("spill", env) as vm:
             with vm.session() as session:
                 for name in ("fsync", "synchronous_commit"):
-                    phase2.expect(session, f"SHOW {name};", ["on"])
+                    postgres.expect(session, f"SHOW {name};", ["on"])
                 result["guest_spill"] = spill(session, "guest", expected)
                 session.execute("DROP TABLE IF EXISTS recovery_gate; CREATE TABLE recovery_gate(id int primary key);"
                                 "DROP TABLE IF EXISTS fault_gate; CREATE TABLE fault_gate(id text primary key);")
@@ -448,7 +448,7 @@ def test():
                 session.execute("BEGIN; INSERT INTO recovery_gate VALUES (900); ROLLBACK; CHECKPOINT;")
                 result["backend_memory_bytes"] = int(session.execute(
                     "SELECT sum(total_bytes) FROM pg_backend_memory_contexts;")[0])
-            if temp_files(phase3.STORAGE / "pgdata"):
+            if temp_files(storage.STORAGE / "pgdata"):
                 raise RuntimeError("guest external sort left temporary files")
             result["lifecycle"] = lifecycle(vm)
         result["spill_vm"] = vm.result
@@ -495,22 +495,22 @@ def test():
         result["faults"] = {}
         for operation in ("write", "sync", "quota"):
             fault_test(operation, env, expected, result["faults"])
-        if temp_files(phase3.STORAGE / "pgdata"):
+        if temp_files(storage.STORAGE / "pgdata"):
             raise RuntimeError("recovery left spill temp files")
         result["inputs"] = {
-            "phase4_sha256": phase1.digest(phase1.HERE / "phase4.py"),
-            "host_sha256": phase1.digest(phase3.DATA / "storage-host"),
-            "rootfs_sha256": phase1.digest(phase3.DATA / "postgres.cpio"),
-            "native_postgres_sha256": phase1.digest(phase2.NATIVE / "bin/postgres"),
-            "native_psql_sha256": phase1.digest(phase2.NATIVE / "bin/psql"),
+            "phase4_sha256": runtime.digest(runtime.HERE / "recovery.py"),
+            "host_sha256": runtime.digest(storage.DATA / "storage-host"),
+            "rootfs_sha256": runtime.digest(storage.DATA / "postgres.cpio"),
+            "native_postgres_sha256": runtime.digest(postgres.NATIVE / "bin/postgres"),
+            "native_psql_sha256": runtime.digest(postgres.NATIVE / "bin/psql"),
         }
         result["status"] = "passed"
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
         result.update(status="failed", error=str(error))
         raise
     finally:
-        phase1.write_json(DATA / "results.json", result)
-    print("PASS phase4: measured native/guest spill, lifecycle, fresh-VM restart/recovery, WAL faults")
+        runtime.write_json(DATA / "results.json", result)
+    print("PASS recovery: measured native/guest spill, lifecycle, fresh-VM restart/recovery, WAL faults")
 
 
 def main():
@@ -518,7 +518,7 @@ def main():
     parser.add_argument("command", choices=("test",))
     parser.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
-    with (phase1.WORK / "phase1.lock").open("w") as lock:
+    with (runtime.WORK / "phase1.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         test()
 
