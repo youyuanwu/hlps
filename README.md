@@ -6,17 +6,18 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
 
 - [C guest demo](samples/c-guest/README.md): build a freestanding C guest and
   call it from a Rust host using a Linux KVM micro-VM, or statically link the
-  same guest into a native Rust subprocess without KVM.
+  same guest into a native Rust subprocess or directly into its host without KVM.
 
 ## Rust workspace
 
 - [hyperlight-process](crates/hyperlight-process/): generic native C guest adapter,
-  Vercode IPC protocol, and reusable Rust subprocess client.
+  Vercode IPC protocol, Rust subprocess client, and direct in-process runner.
 - [KVM host](samples/c-guest/host/): the original Hyperlight micro-VM demo.
-- [Native sample](samples/c-guest/native/): statically linked runner and parent demo.
+- [Native sample](samples/c-guest/native/): subprocess and direct statically linked demos.
 
 ```sh
 CARGO_BUILD_JOBS=1 make -C samples/c-guest run-native
+CARGO_BUILD_JOBS=1 make -C samples/c-guest run-inprocess
 CARGO_BUILD_JOBS=1 cargo test --workspace --locked
 ```
 

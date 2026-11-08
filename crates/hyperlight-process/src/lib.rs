@@ -7,7 +7,9 @@ compile_error!("the native Hyperlight C adapter currently supports Linux x86_64 
 pub mod abi;
 pub mod client;
 pub mod func;
+pub mod inprocess;
 pub mod protocol;
 pub mod runtime;
 
 pub use client::{Runner, RunnerBuilder};
+pub use inprocess::{InProcessRunner, InProcessRunnerBuilder};

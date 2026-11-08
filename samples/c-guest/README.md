@@ -94,6 +94,26 @@ for the micro-VM. Only use trusted guests. Changing the statically linked guest
 requires rebuilding its executable; the adapter itself is function-generic.
 All workspace packages share the root Cargo lockfile and `target/` directory.
 
+## Native in-process execution
+
+To link the same unmodified C guest directly into the Rust host and call it
+without Vercode or subprocess IPC:
+
+```sh
+CARGO_BUILD_JOBS=1 make -C samples/c-guest run-inprocess
+```
+
+The [direct demo](native/src/bin/inprocess.rs) uses
+`InProcessRunnerBuilder::new(hyperlight_main).host_function(...)` and an unsafe
+`build()`, followed by the same typed `call` API. It prints the greeting and
+`Add(20, 22) = 42`, then `All in-process guest checks passed.`
+
+The direct runner is thread-bound and rejects recursive native execution.
+Adapter state is per instance, but native C globals are shared. Guest faults,
+aborts, or memory corruption affect the host process itself. Only run trusted
+guests. See the [runner documentation](../../crates/hyperlight-process/README.md)
+for ownership and panic behavior.
+
 ## Tests
 
 ```sh
@@ -103,10 +123,10 @@ make -C samples/c-guest test
 # Actual C guest/host round trip in KVM.
 make -C samples/c-guest test-vm
 
-# Actual native Rust subprocess, registration, IPC, callbacks, and errors.
+# Native subprocess and direct C guest integration.
 make -C samples/c-guest test-native
 
-# Adapter and wire-format tests plus native C subprocess integration.
+# Adapter, wire-format, direct execution, and native C integration tests.
 CARGO_BUILD_JOBS=1 cargo test -p hyperlight-process -p hyperlight-c-guest-native --locked
 ```
 
