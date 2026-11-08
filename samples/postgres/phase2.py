@@ -248,23 +248,23 @@ def package():
 
 
 class Session:
-    def __init__(self, name, env, log_dir=DATA):
+    def __init__(self, name, env, log_dir=DATA, port=PORT):
         self.log = (log_dir / f"psql-{name}.log").open("wb")
         self.process = subprocess.Popen(
             [str(NATIVE / "bin/psql"), "-X", "-qAt", "-F", "|",
-             "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-p", str(PORT),
+             "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-p", str(port),
              "-U", "phase2", "-d", "postgres"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env)
         self.buffer = b""
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
 
-    def execute(self, sql):
+    def execute(self, sql, timeout=10):
         marker = "HL_DONE_" + secrets.token_hex(8)
         self.process.stdin.write((sql + "\n\\echo " + marker + "\n").encode())
         self.process.stdin.flush()
         lines = []
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + timeout
         while True:
             if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
@@ -276,7 +276,7 @@ class Session:
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self.selector.select(remaining):
-                raise RuntimeError("SQL statement exceeded its 10-second deadline")
+                raise RuntimeError(f"SQL statement exceeded its {timeout}-second deadline")
             chunk = os.read(self.process.stdout.fileno(), 4096)
             if not chunk:
                 raise RuntimeError(f"psql exited during SQL; inspect {self.log.name}")
@@ -296,10 +296,22 @@ class Session:
             if self.process.poll() is None:
                 self.process.kill()
                 self.process.wait(timeout=5)
-            self.process.stdin.close()
-            self.process.stdout.close()
-            self.selector.close()
-            self.log.close()
+            self.release()
+
+    def release(self):
+        self.process.stdin.close()
+        self.process.stdout.close()
+        self.selector.close()
+        self.log.close()
+
+    def disconnect(self):
+        """Intentionally drop this client, including an open transaction."""
+        try:
+            if self.process.poll() is None:
+                self.process.kill()
+            return self.process.wait(timeout=5)
+        finally:
+            self.release()
 
     def __enter__(self):
         return self

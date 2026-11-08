@@ -1,5 +1,5 @@
 .NOTPARALLEL:
-.PHONY: preflight fetch build test-native test-guest check phase1 phase2 pg-kernel pg-native pg-guest pg-package pg-test phase3 storage-build storage-package storage-init storage-config storage-test
+.PHONY: preflight fetch build test-native test-guest check phase1 phase2 pg-kernel pg-native pg-guest pg-package pg-test phase3 storage-build storage-package storage-init storage-config storage-test phase4 recovery-test
 
 preflight fetch build test-native test-guest:
 	python3 phase1.py $@
@@ -49,3 +49,9 @@ storage-test:
 
 phase3:
 	$(MAKE) preflight fetch storage-build storage-package storage-config check storage-test
+
+recovery-test:
+	python3 phase4.py test
+
+phase4:
+	$(MAKE) preflight fetch storage-build storage-package check storage-test recovery-test

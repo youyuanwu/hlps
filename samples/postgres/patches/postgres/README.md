@@ -27,11 +27,15 @@ checks remain intact. Executable-path reuse assumes the tested fixed package
 is not upgraded or replaced during its VM lifetime; it is not a general
 replacement for PostgreSQL's installation/version check.
 
-Scope: one fresh VM, exclusive host experiment lock, RAM-only PGDATA/WAL/temp,
-no host mounts, and no warm snapshots. Raw address descriptors are invalid for
-another VM generation. A stale data-directory shared-memory interlock is a
-fatal error, not a successful "unused" result. This is not yet a persistent
-storage port or a PostgreSQL replacement on Linux.
+Scope: one fresh VM and exclusive host experiment ownership, RAM-only data in
+Phase 2 or the bounded host-backed storage/recovery gates in Phases 3-4, and no
+warm snapshots. Raw address descriptors are invalid for another VM generation.
+A stale data-directory shared-memory interlock is a fatal error, not a
+successful "unused" result. The persistent host removes only recognized stale
+guest lockfiles while exclusively owning storage. PostgreSQL's existing mmap
+DSM startup cleanup removes old descriptors without attaching their addresses;
+Phase 4 verifies fresh identities across actual crashes. This is not a
+production PostgreSQL replacement on Linux or a power-loss durability proof.
 
 The SQL gate validates required auxiliary processes, independent concurrent
 backends, transactions, settings/temp-table isolation, repeated attach/detach,

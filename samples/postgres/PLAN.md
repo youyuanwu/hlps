@@ -1,8 +1,9 @@
 # PostgreSQL on Hyperlight-Unikraft: experiment plan
 
-Status: **Phases 1-3 implemented and validated within their documented scope**.
-See [instructions and results](README.md). Crash recovery,
-spilling, and power-loss durability are not yet established.
+Status: **Phases 1-4 implemented and validated within their documented scope**.
+See [instructions and results](README.md). Disk spilling and fresh-VM recovery
+pass the bounded host-process/WAL-error gates; power-loss durability is not
+established. Phase 5 evaluation has not started.
 Prepared 2026-11-08.
 
 ## Objective
@@ -290,6 +291,16 @@ machine or drop its caches for a test.
 demo, `fsync = off`, or successful sequential connections cannot satisfy this
 gate. If shared-memory lifecycle or storage semantics remain unreliable,
 document the exact failure and stop short of a durability claim.
+
+2026-11-08: this targeted gate passes. Native and guest external sorts process
+100,000 rows with matching exact checksums, measured disk space/temp I/O, and
+cleanup. Sixteen acknowledged commits survive graceful restart and owned-host
+SIGKILL/fresh-VM WAL recovery. Old DSM descriptor generations are discarded
+without attaching their addresses. Backend termination/client disconnect and
+reconnect checks pass. SQL-time WAL write/sync EIO and EDQUOT are explicit
+unacknowledged failures, with fresh-VM recovery after each. The sync-error row
+can still recover from host-cached WAL: this is an unknown commit outcome, not
+proof of rollback or power-loss durability. See [results and limits](README.md).
 
 ## Phase 5: measured evaluation and optional feature expansion
 

@@ -1,11 +1,12 @@
 # PostgreSQL experiment
 
 This directory implements the Hyperlight-Unikraft baseline/process probes,
-PostgreSQL 16.15 RAM-only prototype, and host-backed storage boundary from
+PostgreSQL 16.15 RAM-only prototype, and host-backed storage/recovery gates from
 [the plan](PLAN.md). Phase 1 needs no network, host mounts, database files,
 or snapshots. Phase 2 uses authenticated loopback TCP and an initialized
-in-guest database. Phase 3 enables real host-backed synchronization; crash
-recovery and power-loss durability are not yet established.
+in-guest database. Phase 3 enables real host-backed synchronization; Phase 4
+measures disk spilling and fresh-VM recovery with SQL-time WAL errors.
+Power-loss durability and production readiness are not established.
 
 ## Phase 1: build and run
 
@@ -361,10 +362,10 @@ sync the relevant file and directory descriptors.
 
 Injected failures model write/sync/quota errors at the host boundary, not loss
 of the host page cache, machine power failure, or every physical filesystem
-fault. No host reboot or global cache manipulation is performed. Crash
-recovery, acknowledged-commit fault tests, stale DSM cleanup after crashes,
-measured spilling, and broader filesystem/descriptor compatibility belong to
-Phase 4 or follow-ups; snapshots remain forbidden.
+fault. No host reboot or global cache manipulation is performed. Phase 3 alone
+does not establish crash recovery, acknowledged-commit survival, or measured
+spilling; the bounded Phase 4 tests below exercise those paths. Broader
+filesystem/descriptor compatibility remains unsupported; snapshots are forbidden.
 
 ### Phase 3 results (2026-11-08)
 
@@ -391,3 +392,118 @@ disk scans do not skip inaccessible subdirectories.
 This passes Phase 3's limited gate, not Phase 4's spill/crash-recovery/durability
 gate. The path-based descriptor and advisory-lock limitations above remain
 explicit follow-ups.
+
+## Phase 4: measured spill and fresh-VM recovery
+
+With the previously initialized persistent storage:
+
+```sh
+make -C samples/postgres phase4
+# Repeat only the recovery/spill tests without rebuilding:
+make -C samples/postgres recovery-test
+```
+
+`phase4` rebuilds the instrumented host/rootfs, runs helper tests and the
+Phase 3 gate, then runs [phase4.py](phase4.py). It does not reinitialize PGDATA
+or change the persistent configuration. Source/build/configuration hashes are
+verified first. The tests recreate only their `spill_fixture`, `recovery_gate`,
+and `fault_gate` tables in this dedicated experiment database.
+
+An unmodified native PostgreSQL 16.15 server is started serially on loopback
+port 55434, against a separate generated `phase4/native-pgdata` directory.
+It uses the same conservative configuration, C locale, credentials, and
+synchronization settings. It is a correctness baseline, not a performance
+comparison. No native server and guest VM run concurrently.
+
+Both servers sort 100,000 deterministic rows with 128-character sortable
+values at `work_mem=64kB`. JSON `EXPLAIN (ANALYZE,BUFFERS)` must report a
+disk-backed sort, positive disk space, exactly 100,000 actual rows, and
+nonzero temp reads **and** writes. The entire ordered result is checksummed
+against both native PostgreSQL and a separately computed Python expectation.
+Exact counts, ID bounds, row payloads, and temp-file cleanup are also checked.
+
+The guest gate then checks:
+
+- Sixteen individually acknowledged transactions survive a fresh VM:
+  eight across graceful shutdown and eight more written after the last
+  checkpoint before the crash.
+- `SIGKILL` targets only the identified host executable in this launcher's
+  process tree, with an uncommitted transaction and another active SQL session.
+  The fresh VM completes actual WAL replay and an end-of-recovery checkpoint;
+  uncommitted rows are absent.
+- Terminating a backend and abruptly disconnecting a client roll back their
+  open transactions without breaking the other session; twelve reconnects
+  still see the exact committed rows.
+- One-shot WAL write EIO, sync EIO, and EDQUOT occur during real SQL commits.
+  Each produces the expected PostgreSQL `PANIC`, failed client exit, and no
+  `COMMIT` acknowledgement. Each is followed by owned-host termination and
+  a fresh, fault-free VM recovery.
+
+### Crash ownership and ephemeral IPC
+
+The VM host takes the existing exclusive storage-directory inode lock
+**before** examining a leftover `postmaster.pid`. Only the recognized guest
+format (guest data path, port, loopback address, empty socket directory, and
+zero SysV interlock) may be removed. Malformed/native lockfiles are refused,
+never reinterpreted as dead host PIDs. The removal and real PGDATA-directory
+sync are audited. This depends on the existing single-writer workflow; it
+does not protect against unrelated native tools ignoring the advisory lock.
+
+No PostgreSQL patch was added for crash cleanup. Its existing mmap DSM
+startup cleanup removes old descriptor files without mapping their saved
+addresses. The test requires actual old-generation descriptors after the
+crash and only fresh-generation descriptors once the new VM is ready.
+Other stale locks and unrecognized partial files still require inspection.
+
+The optional fault-control file is outside mounted storage, atomically armed,
+limited to WAL writes/syncs, and consumed exactly once. A leftover control
+file aborts the next recovery test instead of silently clearing it. EDQUOT is
+a controlled host-boundary quota error, not filling this shared machine's
+physical disk; the real 512 MiB logical budget remains independently enforced.
+
+`SIGKILL` can interrupt writing the host's JSONL audit. Only an unterminated
+final record is permitted for a crashed host or a live snapshot, and its byte
+count is recorded for crashed hosts. Completed malformed records and partial
+records after clean shutdown fail. Only complete successful sync records
+count as synchronization evidence.
+
+### Bounds, results, and limits (2026-11-08)
+
+**Targeted Phase 4 gate passed**, including repeated fresh-VM runs.
+
+| Measurement/check | Observed result |
+|-------------------|-----------------|
+| Profile | PostgreSQL 16.15; `fsync=on`, `synchronous_commit=on`, WAL method `fsync` |
+| Rows / ordered checksum | 100,000 / `6d334d76c6d5153bbf8eebf552f99702`, matching native and Python |
+| Native disk sort | 27,280 KiB; 13,614 temp blocks read / 14,334 written |
+| Guest disk sort | 27,272 KiB; 13,610 temp blocks read / 14,352 written |
+| Restart / crash | Exact committed rows and fixture checksum survive; actual WAL replay completes |
+| Ephemeral IPC | Old-generation descriptors discarded; no stale addresses attached |
+| SQL fault outcomes | No commit acknowledged; write/EDQUOT rows absent after recovery |
+| Sync-error outcome | Unacknowledged row recovered; **unknown commit outcome**, not rollback proof |
+| Sampled host RSS | Below 130 MiB; 1 GiB hard test limit |
+| Logical storage high-water | Below 81 MiB; 512 MiB enforced budget |
+| Queried backend memory | About 2.12 MiB; not total guest memory |
+| Regressions / helpers | 9 native + 9 KVM probes; Phase 2 and Phase 3 gates; 20 Python and 7 targeted Rust tests; Clippy with warnings denied |
+
+Each VM retains the 120-second host deadline and 512 MiB scratch cap. SQL
+normally has a 10-second deadline (60 seconds for bounded fixture/sort/checksum
+work); fault clients have 20 seconds, startup 30 seconds, and shutdown
+15 seconds. Hosts run serially. Host RSS is sampled every 100 ms from process
+identification until teardown; samples cannot prove instantaneous peaks.
+Audited logical-file accounting captures spill growth and verifies cleanup.
+The native fixture directory has its own 512 MiB check.
+
+Ignored `target/postgres-experiment/phase4/` artifacts include native/guest
+EXPLAIN JSON, client/guest logs, unique per-VM audits, credentials, the native
+baseline database, and `results.json` with hashes and measured outcomes.
+No server is deliberately left running after the gate.
+
+This is a persistent-storage **candidate under the tested fault model**,
+not a production or power-loss durability certification. SIGKILL preserves
+the host OS page cache; a sync error can leave a transaction recoverable even
+though the client never received its commit acknowledgement. Applications
+must handle that ambiguity rather than blindly retrying a non-idempotent
+transaction. No power-off, global cache dropping, arbitrary torn writes,
+live snapshots, full POSIX descriptor semantics, or broad locking support
+is claimed. Phase 5 evaluation and optional features remain separate work.
