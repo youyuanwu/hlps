@@ -1,0 +1,3 @@
+0001-guest-entry-and-posix-spawn.patch
+0002-single-address-space-main-memory.patch
+0003-vm-scoped-dynamic-shared-memory.patch

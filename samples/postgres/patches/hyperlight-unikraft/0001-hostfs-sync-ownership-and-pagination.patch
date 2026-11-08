@@ -1,0 +1,236 @@
+diff --git a/build.rs b/build.rs
+index 030a890..be46e42 100644
+--- a/build.rs
++++ b/build.rs
+@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
+ /// the guest MSR list, and the hyperlight-host release that reads a
+ /// snapshot.  Bump it when any of those changes in a way a snapshot would
+ /// notice; a kernel change rolls the key by itself.
+-const SNAPSHOT_CONTRACT: u32 = 8;
++const SNAPSHOT_CONTRACT: u32 = 9;
+ 
+ /// The embedded kernel, whose code and host-call protocol a snapshot
+ /// carries in its memory: one per architecture, named as Unikraft names
+diff --git a/src/hostfs.rs b/src/hostfs.rs
+index 273ecb2..363b991 100644
+--- a/src/hostfs.rs
++++ b/src/hostfs.rs
+@@ -92,6 +92,8 @@ pub struct FileStat {
+     pub accessed: SystemTime,
+     pub modified: SystemTime,
+     pub changed: SystemTime,
++    pub uid: u32,
++    pub gid: u32,
+ }
+ 
+ impl FileStat {
+@@ -103,6 +105,8 @@ impl FileStat {
+             accessed: UNIX_EPOCH,
+             modified: UNIX_EPOCH,
+             changed: UNIX_EPOCH,
++            uid: 0,
++            gid: 0,
+         }
+     }
+ 
+@@ -114,6 +118,8 @@ impl FileStat {
+             accessed: UNIX_EPOCH,
+             modified: UNIX_EPOCH,
+             changed: UNIX_EPOCH,
++            uid: 0,
++            gid: 0,
+         }
+     }
+ 
+@@ -188,6 +194,14 @@ pub trait FsBackend: Send + Sync {
+     fn remove(&self, path: &str) -> io::Result<()>;
+     fn truncate(&self, path: &str, len: u64) -> io::Result<()>;
+     fn list(&self, path: &str) -> io::Result<Vec<DirEntry>>;
++    /// Page in stable name order. Unsupported backends must fail explicitly.
++    fn list_page(&self, _path: &str, _after: &str, _limit: usize) -> io::Result<Vec<DirEntry>> {
++        Err(io::ErrorKind::Unsupported.into())
++    }
++    /// Synchronize a file or directory to the underlying storage.
++    fn sync(&self, _path: &str, _data_only: bool) -> io::Result<()> {
++        Err(io::ErrorKind::Unsupported.into())
++    }
+     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+     /// Make `link` a symbolic link to `target`.  Refused by default.
+     fn symlink(&self, _link: &str, _target: &str) -> io::Result<()> {
+@@ -220,7 +234,13 @@ pub trait FsBackend: Send + Sync {
+ 
+ /// A host directory, the backend of a mount made with [`Mount::rw`] or
+ /// [`Mount::ro`].
+-struct DirBackend(Dir);
++pub struct DirBackend(Dir);
++
++impl DirBackend {
++    pub fn open(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
++        Dir::open_ambient_dir(path, ambient_authority()).map(Self)
++    }
++}
+ 
+ impl FsBackend for DirBackend {
+     fn stat(&self, path: &str) -> io::Result<FileStat> {
+@@ -231,12 +251,21 @@ impl FsBackend for DirBackend {
+             self.0.metadata(path)?
+         };
+         let [accessed, modified, changed] = times(&m);
++        #[cfg(unix)]
++        let (uid, gid) = {
++            use cap_std::fs::MetadataExt;
++            (m.uid(), m.gid())
++        };
++        #[cfg(not(unix))]
++        let (uid, gid) = (0, 0);
+         Ok(FileStat {
+             size: m.len(),
+             mode: synth_mode(&m),
+             accessed,
+             modified,
+             changed,
++            uid,
++            gid,
+         })
+     }
+ 
+@@ -312,6 +341,33 @@ impl FsBackend for DirBackend {
+         Ok(entries)
+     }
+ 
++    fn list_page(&self, path: &str, after: &str, limit: usize) -> io::Result<Vec<DirEntry>> {
++        use std::collections::BTreeMap;
++        let mut page = BTreeMap::new();
++        for entry in self.0.read_dir(beneath(path))? {
++            let entry = entry?;
++            let name = entry.file_name().into_string()
++                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
++            if name.as_str() <= after {
++                continue;
++            }
++            page.insert(name, entry.file_type()?.is_dir());
++            if page.len() > limit {
++                page.pop_last();
++            }
++        }
++        Ok(page.into_iter().map(|(name, is_dir)| DirEntry::new(name, is_dir)).collect())
++    }
++
++    fn sync(&self, path: &str, data_only: bool) -> io::Result<()> {
++        let file = self.0.open(beneath(path))?;
++        if data_only && !file.metadata()?.is_dir() {
++            file.sync_data()
++        } else {
++            file.sync_all()
++        }
++    }
++
+     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+         self.0.rename(from, &self.0, to)
+     }
+@@ -435,6 +491,12 @@ impl FsBackend for Guarded<'_> {
+     fn list(&self, path: &str) -> io::Result<Vec<DirEntry>> {
+         self.ask(|b| b.list(path))
+     }
++    fn list_page(&self, path: &str, after: &str, limit: usize) -> io::Result<Vec<DirEntry>> {
++        self.ask(|b| b.list_page(path, after, limit))
++    }
++    fn sync(&self, path: &str, data_only: bool) -> io::Result<()> {
++        self.ask(|b| b.sync(path, data_only))
++    }
+     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+         self.ask(|b| b.rename(from, to))
+     }
+@@ -519,6 +581,8 @@ pub(crate) fn register(
+                             buf.extend(secs.to_le_bytes());
+                             buf.extend(nanos.to_le_bytes());
+                         }
++                        buf.extend(st.uid.to_le_bytes());
++                        buf.extend(st.gid.to_le_bytes());
+                         debug_assert_eq!(buf.len(), STAT_LEN);
+                         buf
+                     }
+@@ -528,6 +592,61 @@ pub(crate) fn register(
+         )?;
+     }
+ 
++    {
++        let mounts = mounts.clone();
++        let prof = profile.clone();
++        target.register_host_function(
++            "fs_sync",
++            move |mount_idx: i32, path: String, data_only: i32| -> hyperlight_host::Result<i32> {
++                let _profile = prof.host("fs_sync");
++                if !(0..=1).contains(&data_only) {
++                    return Ok(-errno::EINVAL);
++                }
++                Ok(status(mounts.get(mount_idx).map(|b| b.sync(&path, data_only != 0))))
++            },
++        )?;
++    }
++    {
++        let mounts = mounts.clone();
++        let prof = profile.clone();
++        target.register_host_function(
++            "fs_list_page",
++            move |mount_idx: i32, path: String, after: String, limit: u64|
++                  -> hyperlight_host::Result<Vec<u8>> {
++                let _profile = prof.host("fs_list_page");
++                let count = (limit.min(128)) as usize;
++                if count == 0 {
++                    return Ok(status_vec(errno::EINVAL));
++                }
++                let backend = match mounts.get(mount_idx) {
++                    Ok(b) => b,
++                    Err(code) => return Ok(status_vec(code)),
++                };
++                let page = match backend.list_page(&path, &after, count) {
++                    Ok(page) => page,
++                    Err(e) => return Ok(errno_vec(e)),
++                };
++                if page.len() > count {
++                    return Ok(status_vec(errno::EIO));
++                }
++                let mut buf = vec![0; 8];
++                let mut previous = after.as_str();
++                for entry in &page {
++                    if entry.name.as_str() <= previous || entry.name.len() > NAME_MAX
++                        || entry.name.contains(['/', '\0']) || entry.name == "." || entry.name == ".." {
++                        return Ok(status_vec(errno::EIO));
++                    }
++                    buf.push(entry.is_dir as u8);
++                    buf.extend((entry.name.len() as u16).to_le_bytes());
++                    buf.extend(entry.name.as_bytes());
++                    previous = &entry.name;
++                }
++                buf[4..8].copy_from_slice(&(page.len() as u32).to_le_bytes());
++                Ok(buf)
++            },
++        )?;
++    }
++
+     // ── fs_read_bytes ───────────────────────────────────────────
+     //
+     // Returns Vec<u8>:
+@@ -848,7 +967,7 @@ pub(crate) fn register(
+ // ── Helpers ──────────────────────────────────────────────────────────
+ 
+ /// The length of a successful `fs_stat` reply.
+-const STAT_LEN: usize = 18 + 3 * 12;
++const STAT_LEN: usize = 18 + 3 * 12 + 8;
+ 
+ /// A guest path as cap-std takes it: the empty path the mount root goes
+ /// by is `.` to cap-std.
+diff --git a/src/lib.rs b/src/lib.rs
+index 5fcf088..51e9205 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -47,7 +47,7 @@ pub mod net_policy;
+ mod profile;
+ 
+ pub use cgroup::{CONTAINER_SCRATCH_HEADROOM_MB, cgroup_memory_limit_mb, scratch_mb_within};
+-pub use hostfs::{DirEntry, FileStat, FsBackend, S_IFDIR, S_IFMT, S_IFREG};
++pub use hostfs::{DirBackend, DirEntry, FileStat, FsBackend, S_IFDIR, S_IFMT, S_IFREG};
+ pub use net_policy::{
+     AllowList, BlockList, Destination, Filter, ListenPorts, NetworkFilter, NetworkPolicy,
+     ResolveError,

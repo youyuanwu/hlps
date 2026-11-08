@@ -1,0 +1,150 @@
+diff --git a/src/backend/storage/ipc/dsm_impl.c b/src/backend/storage/ipc/dsm_impl.c
+index 0ac0035..552348f 100644
+--- a/src/backend/storage/ipc/dsm_impl.c
++++ b/src/backend/storage/ipc/dsm_impl.c
+@@ -793,6 +793,137 @@ dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
+ 			  void **impl_private, void **mapped_address, Size *mapped_size,
+ 			  int elevel)
+ {
++#ifdef HYPERLIGHT_UNIKRAFT
++	struct
++	{
++		uint64		magic;
++		uint64		address;
++		uint64		size;
++		char		generation[33];
++	}			desc;
++	const uint64 magic = UINT64CONST(0x484c44534d303031);
++	const char *generation = getenv("HL_PG_VM_ID");
++	char		name[64];
++	void	   *address;
++	int			fd;
++	int			saved_errno;
++	ssize_t		count;
++	struct stat st;
++
++	if (generation == NULL || strlen(generation) != 32)
++		ereport(FATAL, (errmsg("missing fresh VM identity for guest shared memory")));
++	snprintf(name, sizeof(name), PG_DYNSHMEM_DIR "/" PG_DYNSHMEM_MMAP_FILE_PREFIX "%u",
++			 handle);
++
++	if (op == DSM_OP_DETACH)
++	{
++		/* Other processes still use this single-address-space mapping. */
++		*mapped_address = NULL;
++		*mapped_size = 0;
++		return true;
++	}
++	if (op == DSM_OP_CREATE &&
++		(request_size == 0 || request_size > (Size) 536870912))
++	{
++		ereport(elevel,
++				(errcode_for_dynamic_shared_memory(),
++				 errmsg("invalid guest shared memory allocation size %zu", request_size)));
++		return false;
++	}
++
++	fd = OpenTransientFile(name, op == DSM_OP_CREATE ?
++						   O_RDWR | O_CREAT | O_EXCL : O_RDONLY);
++	if (fd < 0)
++	{
++		if (op != DSM_OP_CREATE || errno != EEXIST)
++			ereport(elevel,
++					(errcode_for_dynamic_shared_memory(),
++					 errmsg("could not open guest shared memory descriptor \"%s\": %m", name)));
++		return false;
++	}
++	if (op != DSM_OP_CREATE)
++	{
++		count = read(fd, &desc, sizeof(desc));
++		if (count != (ssize_t) sizeof(desc) || fstat(fd, &st) != 0 ||
++			st.st_size != sizeof(desc) || desc.magic != magic ||
++			desc.generation[32] != '\0' ||
++			strcmp(desc.generation, generation) != 0 ||
++			desc.address == 0 || desc.address % 4096 != 0 ||
++			desc.size == 0 || desc.size > UINT64CONST(536870912))
++		{
++			CloseTransientFile(fd);
++			ereport(elevel,
++					(errcode_for_dynamic_shared_memory(),
++					 errmsg("invalid or stale guest shared memory descriptor \"%s\"", name)));
++			return false;
++		}
++		if (CloseTransientFile(fd) != 0)
++		{
++			ereport(elevel,
++					(errcode_for_file_access(),
++					 errmsg("could not close guest shared memory descriptor \"%s\": %m", name)));
++			return false;
++		}
++		address = (void *) (uintptr_t) desc.address;
++		if (op == DSM_OP_ATTACH)
++		{
++			*mapped_address = address;
++			*mapped_size = (Size) desc.size;
++			return true;
++		}
++		Assert(op == DSM_OP_DESTROY);
++		/* Destroy also resolves segments this process has never attached. */
++		if (munmap(address, (Size) desc.size) != 0 || unlink(name) != 0)
++		{
++			ereport(elevel,
++					(errcode_for_dynamic_shared_memory(),
++					 errmsg("could not destroy guest shared memory segment \"%s\": %m", name)));
++			return false;
++		}
++		*mapped_address = NULL;
++		*mapped_size = 0;
++		return true;
++	}
++
++	address = mmap(NULL, request_size, PROT_READ | PROT_WRITE,
++				   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (address == MAP_FAILED)
++		goto create_failed;
++	memset(&desc, 0, sizeof(desc));
++	desc.magic = magic;
++	desc.address = (uint64) (uintptr_t) address;
++	desc.size = request_size;
++	strcpy(desc.generation, generation);
++	count = write(fd, &desc, sizeof(desc));
++	if (count != (ssize_t) sizeof(desc))
++	{
++		if (count >= 0)
++			errno = ENOSPC;
++		goto create_failed;
++	}
++	if (CloseTransientFile(fd) != 0)
++	{
++		fd = -1;
++		goto create_failed;
++	}
++	*mapped_address = address;
++	*mapped_size = request_size;
++	return true;
++
++create_failed:
++	saved_errno = errno;
++	if (address != MAP_FAILED && munmap(address, request_size) != 0)
++		ereport(LOG, (errmsg("could not unmap failed guest shared memory allocation: %m")));
++	if (fd >= 0 && CloseTransientFile(fd) != 0)
++		ereport(LOG, (errmsg("could not close failed guest shared memory descriptor: %m")));
++	if (unlink(name) != 0)
++		ereport(LOG, (errmsg("could not remove failed guest shared memory descriptor: %m")));
++	errno = saved_errno;
++	ereport(elevel,
++			(errcode_for_dynamic_shared_memory(),
++			 errmsg("could not create guest shared memory segment \"%s\": %m", name)));
++	return false;
++#else
+ 	char		name[64];
+ 	int			flags;
+ 	int			fd;
+@@ -947,6 +1078,7 @@ dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
+ 	}
+ 
+ 	return true;
++#endif
+ }
+ #endif
+ 

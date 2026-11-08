@@ -1,0 +1,24 @@
+[postgres]
+version = "16.15"
+url = "https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2"
+sha256 = "c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed"
+license = "PostgreSQL; COPYRIGHT inside archive"
+
+[hyperlight-unikraft]
+url = "https://github.com/hyperlight-dev/hyperlight-unikraft.git"
+commit = "155d333bad549377e8026a596ce89c0d4cd8e9ef"
+license = "Apache-2.0; LICENSE"
+
+[hyperlight-unikraft.submodules]
+"kernel/unikraft" = "3b7cba8816c02a497e7b5aa9c901655784a01000"
+"kernel/app-elfloader" = "bc7d759bdd9a96165674c63177017e64f34b5096"
+"kernel/libs/libelf" = "c03d4ceb22a2b9e9799238f9c277a14284d313ad"
+
+[hyperlight-unikraft.dependencies]
+hyperlight-host = "0.19.0"
+hyperlight-common = "0.19.0"
+
+[bsdkrun]
+url = "https://github.com/tsirysndr/bsdkrun.git"
+commit = "b31ff8ebed68d0ea9cba88345f4a99dc13c01fb7"
+license = "MIT; LICENSE (individual patches must also retain original notices)"

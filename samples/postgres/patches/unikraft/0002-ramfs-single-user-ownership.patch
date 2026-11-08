@@ -1,0 +1,45 @@
+diff --git a/lib/ramfs/ramfs.h b/lib/ramfs/ramfs.h
+index 2087be0..18a61c4 100644
+--- a/lib/ramfs/ramfs.h
++++ b/lib/ramfs/ramfs.h
+@@ -35,6 +35,7 @@
+ 
+ #include <vfscore/prex.h>
+ #include <stdbool.h>
++#include <sys/types.h>
+ 
+ /**
+  * struct ramfs_node - A filesystem entry node for RamFS
+@@ -77,6 +78,8 @@ struct ramfs_node {
+ 	struct timespec rn_mtime;
+ 	/* Node access mode */
+ 	int rn_mode;
++	uid_t rn_uid;
++	gid_t rn_gid;
+ 	/* Whether the rn_buf was allocated in this ramfs_node */
+ 	bool rn_owns_buf;
+ };
+diff --git a/lib/ramfs/ramfs_vnops.c b/lib/ramfs/ramfs_vnops.c
+index 984e29a..4bd1bb5 100644
+--- a/lib/ramfs/ramfs_vnops.c
++++ b/lib/ramfs/ramfs_vnops.c
+@@ -105,6 +105,10 @@ ramfs_allocate_node(const char *name, int type, mode_t mode)
+ 	if (np == NULL)
+ 		return NULL;
+ 	memset(np, 0, sizeof(struct ramfs_node));
++#if CONFIG_LIBPOSIX_USER
++	np->rn_uid = CONFIG_LIBPOSIX_USER_UID;
++	np->rn_gid = CONFIG_LIBPOSIX_USER_GID;
++#endif
+ 
+ 	np->rn_namelen = strlen(name);
+ 	np->rn_name = (char *) malloc(np->rn_namelen + 1);
+@@ -828,6 +832,8 @@ ramfs_getattr(struct vnode *vnode, struct vattr *attr)
+ 	attr->va_size = vnode->v_size;
+ 
+ 	attr->va_type = np->rn_type;
++	attr->va_uid = np->rn_uid;
++	attr->va_gid = np->rn_gid;
+ 
+ 	memcpy(&(attr->va_atime), &(np->rn_atime), sizeof(struct timespec));
+ 	memcpy(&(attr->va_ctime), &(np->rn_ctime), sizeof(struct timespec));

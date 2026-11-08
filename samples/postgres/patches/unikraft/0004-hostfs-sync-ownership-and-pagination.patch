@@ -1,0 +1,515 @@
+diff --git a/lib/hostfs/hostfs_vfsops.c b/lib/hostfs/hostfs_vfsops.c
+index 6c49a96..b87b651 100644
+--- a/lib/hostfs/hostfs_vfsops.c
++++ b/lib/hostfs/hostfs_vfsops.c
+@@ -84,6 +84,7 @@ static int hostfs_mount(struct mount *mp, const char *dev,
+ 	mp->m_root->d_vnode->v_data = root;
+ 	mp->m_root->d_vnode->v_type = VDIR;
+ 	mp->m_root->d_vnode->v_mode = S_IFDIR | 0755;
++	mp->m_root->d_vnode->v_flags |= VNOCLOSESYNC;
+ 
+ 	return 0;
+ }
+@@ -103,7 +104,10 @@ static int hostfs_unmount(struct mount *mp, int flags)
+ 	return 0;
+ }
+ 
+-#define hostfs_sync    ((vfsop_sync_t)vfscore_nullop)
++static int hostfs_sync(struct mount *mp __unused)
++{
++	return EOPNOTSUPP;
++}
+ #define hostfs_vget    ((vfsop_vget_t)vfscore_nullop)
+ #define hostfs_statfs  ((vfsop_statfs_t)vfscore_nullop)
+ 
+diff --git a/lib/hostfs/hostfs_vnops.c b/lib/hostfs/hostfs_vnops.c
+index 90d470d..5b87448 100644
+--- a/lib/hostfs/hostfs_vnops.c
++++ b/lib/hostfs/hostfs_vnops.c
+@@ -81,7 +81,7 @@ static __u64 le_get(const __u8 *b, unsigned int n)
+  * seconds and 4 of nanoseconds.
+  */
+ #define HOST_STAT_TIMES 18
+-#define HOST_STAT_LEN (HOST_STAT_TIMES + 3 * 12)
++#define HOST_STAT_LEN (HOST_STAT_TIMES + 3 * 12 + 8)
+ 
+ /*
+  * Call fs_stat(mount_idx, path) and decode the packed result.
+@@ -92,7 +92,7 @@ static __u64 le_get(const __u8 *b, unsigned int n)
+  */
+ static int host_stat(int mount_idx, const char *path, uint64_t *size,
+ 		     uint32_t *mode, int *is_dir, int *is_file,
+-		     struct timespec *times)
++		     struct timespec *times, uint32_t *owner)
+ {
+ 	struct hl_param p[2];
+ 	__u8 buf[HOST_STAT_LEN];
+@@ -132,6 +132,10 @@ static int host_stat(int mount_idx, const char *path, uint64_t *size,
+ 		times[i].tv_sec = (time_t)le_get(t, 8);
+ 		times[i].tv_nsec = (long)le_get(t + 8, 4);
+ 	}
++	if (owner) {
++		owner[0] = le_get(buf + HOST_STAT_LEN - 8, 4);
++		owner[1] = le_get(buf + HOST_STAT_LEN - 4, 4);
++	}
+ 
+ 	return 0;
+ }
+@@ -158,7 +162,7 @@ hostfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
+ 		return err;
+ 
+ 	err = host_stat(dnp->hf_mount_idx, path, &size, &mode,
+-			&is_dir, &is_file, NULL);
++			&is_dir, &is_file, NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -182,9 +186,10 @@ hostfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
+ 			free(np);
+ 		else
+ 			vp->v_data = np;
+-		vp->v_type = np->hf_type;
++		vp->v_type = is_dir ? VDIR : VREG;
+ 		vp->v_mode = mode;
+ 		vp->v_size = size;
++		vp->v_flags |= VNOCLOSESYNC;
+ 		return 0;
+ 	}
+ 	if (!vp) {
+@@ -193,6 +198,7 @@ hostfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
+ 	}
+ 
+ 	vp->v_data = np;
++	vp->v_flags |= VNOCLOSESYNC;
+ 	vp->v_type = np->hf_type;
+ 	vp->v_mode = mode;
+ 	vp->v_size = size;
+@@ -204,7 +210,7 @@ hostfs_lookup(struct vnode *dvp, const char *name, struct vnode **vpp)
+ /* ── create ───────────────────────────────────────────────────────── */
+ 
+ static int
+-hostfs_create(struct vnode *dvp, const char *name, mode_t mode __unused)
++hostfs_create(struct vnode *dvp, const char *name, mode_t mode)
+ {
+ 	struct hostfs_node *dnp = dvp->v_data;
+ 	char path[1024];
+@@ -240,9 +246,38 @@ hostfs_create(struct vnode *dvp, const char *name, mode_t mode __unused)
+ 	if (hl_hcall_int("fs_write_bytes", p, 5, &ret) < 0)
+ 		return EIO;
+ 
++	if (ret < 0)
++		return -ret;
++	p[2].type = HL_PV_HLINT;
++	p[2].i32_val = mode;
++	if (hl_hcall_int("fs_chmod", p, 3, &ret) < 0)
++		return EIO;
+ 	return ret < 0 ? -ret : 0;
+ }
+ 
++static int host_sync(struct hostfs_node *np)
++{
++	struct hl_param p[3];
++	__s32 ret;
++
++	if (hostfs_stale(np))
++		return ESTALE;
++	p[0].type = HL_PV_HLINT;
++	p[0].i32_val = np->hf_mount_idx;
++	p[1].type = HL_PV_HLSTRING;
++	p[1].str.ptr = np->hf_path;
++	p[1].str.len = strlen(np->hf_path);
++	p[2].type = HL_PV_HLINT;
++	p[2].i32_val = 0;
++	if (hl_hcall_int("fs_sync", p, 3, &ret) < 0)
++		return EIO;
++	return ret < 0 ? -ret : ret ? EIO : 0;
++}
++
++static int hostfs_fsync(struct vnode *vp, struct vfscore_file *fp __unused)
++{
++	return host_sync(vp->v_data);
++}
+ /* ── read ─────────────────────────────────────────────────────────── */
+ 
+ static int
+@@ -394,90 +429,112 @@ hostfs_write(struct vnode *vp, struct uio *uio, int ioflag)
+ 	/* Update vnode size. */
+ 	if (uio->uio_offset > vp->v_size)
+ 		vp->v_size = uio->uio_offset;
++	if (ioflag & IO_SYNC)
++		return host_sync(np);
+ 
+ 	return 0;
+ }
+ 
+ /* ── readdir ──────────────────────────────────────────────────────── */
+ 
+-static int
+-hostfs_readdir(struct vnode *vp, struct vfscore_file *fp,
+-	       struct dirent64 *dir)
++struct hostfs_page {
++	off_t next;
++	char after[256];
++	size_t length;
++	size_t pos;
++	uint32_t remaining;
++	__u8 bytes[];
++};
++
++static int hostfs_open(struct vfscore_file *fp)
+ {
+-	struct hostfs_node *np = vp->v_data;
+-	struct hl_param p[2];
+-	__u8 *buf = hostfs_io.rbuf;
+-	__sz len;
++	struct vnode *vp = fp->f_dentry->d_vnode;
+ 
+-	if (hostfs_stale(np))
+-		return ESTALE;
++	if (vp->v_type == VDIR) {
++		fp->f_data = calloc(1, sizeof(struct hostfs_page) + hostfs_io.result_max);
++		if (!fp->f_data)
++			return ENOMEM;
++	}
++	return 0;
++}
+ 
+-	p[0].type = HL_PV_HLINT;
+-	p[0].i32_val = np->hf_mount_idx;
+-	p[1].type = HL_PV_HLSTRING;
+-	p[1].str.ptr = np->hf_path;
+-	p[1].str.len = strlen(np->hf_path);
++static int hostfs_close(struct vnode *vp __unused, struct vfscore_file *fp)
++{
++	free(fp->f_data);
++	fp->f_data = NULL;
++	return 0;
++}
+ 
+-	if (hl_hcall_vecbytes("fs_list", p, 2, buf, hostfs_io.result_max,
+-			      &len) < 0)
+-		return EIO;
++static int hostfs_readdir(struct vnode *vp, struct vfscore_file *fp, struct dirent64 *dir)
++{
++	struct hostfs_node *np = vp->v_data;
++	struct hostfs_page *page = fp->f_data;
++	__u8 *buf;
++	uint16_t name_len;
+ 
+-	if (len < 8)
++	if (hostfs_stale(np))
++		return ESTALE;
++	if (!page)
+ 		return EIO;
+-
+-	__s32 status = (__s32)(buf[0] | (buf[1] << 8) |
+-			       (buf[2] << 16) | (buf[3] << 24));
+-	if (status < 0)
+-		return -status;
+-
+-	uint32_t count = buf[4] | (buf[5] << 8) |
+-			 (buf[6] << 16) | (buf[7] << 24);
+-
+-	/*
+-	 * fp->f_offset tracks which entry we're on (0-based index).
+-	 * We need to skip entries until we reach fp->f_offset, then
+-	 * return one entry and increment fp->f_offset.
+-	 */
+-	uint32_t target = (uint32_t)fp->f_offset;
+-
+-	if (target >= count)
+-		return ENOENT;
+-
+-	/* Walk the packed entries to find the target. */
+-	size_t pos = 8;
+-	uint32_t idx = 0;
+-
+-	while (idx < count && pos < len) {
+-		if (pos + 3 > len)
+-			break;
+-
+-		__u8 is_dir = buf[pos];
+-		uint16_t name_len = buf[pos + 1] | (buf[pos + 2] << 8);
+-
+-		pos += 3;
+-
+-		if (pos + name_len > len)
+-			break;
+-
+-		if (idx == target) {
+-			size_t copy_len = name_len;
+-
+-			if (copy_len >= sizeof(dir->d_name))
+-				copy_len = sizeof(dir->d_name) - 1;
+-
+-			memcpy(dir->d_name, buf + pos, copy_len);
+-			dir->d_name[copy_len] = '\0';
+-			dir->d_type = is_dir ? DT_DIR : DT_REG;
+-			dir->d_fileno = target + 1;
+-			fp->f_offset = target + 1;
+-			return 0;
+-		}
+-
+-		pos += name_len;
+-		idx++;
++	if (fp->f_offset == 0 && page->next != 0) {
++		page->after[0] = '\0';
++		page->next = 0;
++		page->remaining = 0;
+ 	}
++	if (fp->f_offset != page->next)
++		return EINVAL;
++	if (!page->remaining) {
++		struct hl_param p[4];
++		__sz len;
++		__s32 status;
+ 
+-	return ENOENT;
++		p[0].type = HL_PV_HLINT;
++		p[0].i32_val = np->hf_mount_idx;
++		p[1].type = HL_PV_HLSTRING;
++		p[1].str.ptr = np->hf_path;
++		p[1].str.len = strlen(np->hf_path);
++		p[2].type = HL_PV_HLSTRING;
++		p[2].str.ptr = page->after;
++		p[2].str.len = strlen(page->after);
++		p[3].type = HL_PV_HLULONG;
++		p[3].u64_val = MIN((size_t)128, (hostfs_io.result_max - 8) / 258);
++		if (!p[3].u64_val)
++			return EOVERFLOW;
++		if (hl_hcall_vecbytes("fs_list_page", p, 4, page->bytes,
++				      hostfs_io.result_max, &len) < 0 || len < 4)
++			return EIO;
++		status = (__s32)le_get(page->bytes, 4);
++		if (status < 0)
++			return -status;
++		if (status || len < 8)
++			return EIO;
++		page->remaining = le_get(page->bytes + 4, 4);
++		if (page->remaining > p[3].u64_val)
++			return EIO;
++		page->length = len;
++		page->pos = 8;
++		if (!page->remaining)
++			return ENOENT;
++	}
++	if (page->pos + 3 > page->length)
++		return EIO;
++	buf = page->bytes + page->pos;
++	name_len = le_get(buf + 1, 2);
++	if (!name_len || name_len >= sizeof(dir->d_name) ||
++	    page->pos + 3 + name_len > page->length)
++		return EIO;
++	memcpy(dir->d_name, buf + 3, name_len);
++	dir->d_name[name_len] = '\0';
++	if (strcmp(dir->d_name, page->after) <= 0 ||
++	    strchr(dir->d_name, '/') || strlen(dir->d_name) != name_len)
++		return EIO;
++	dir->d_type = buf[0] ? DT_DIR : DT_REG;
++	strlcpy(page->after, dir->d_name, sizeof(page->after));
++	page->pos += 3 + name_len;
++	page->remaining--;
++	dir->d_fileno = ++page->next;
++	fp->f_offset = page->next;
++	return 0;
+ }
+ 
+ /* ── getattr ──────────────────────────────────────────────────────── */
+@@ -490,13 +547,14 @@ hostfs_getattr(struct vnode *vp, struct vattr *attr)
+ 	uint32_t mode = 0;
+ 	int is_dir = 0, is_file = 0;
+ 	struct timespec times[3];
++	uint32_t owner[2];
+ 	int err;
+ 
+ 	if (hostfs_stale(np))
+ 		return ESTALE;
+ 
+ 	err = host_stat(np->hf_mount_idx, np->hf_path, &size, &mode,
+-			&is_dir, &is_file, times);
++			&is_dir, &is_file, times, owner);
+ 	if (err)
+ 		return err;
+ 
+@@ -508,6 +566,8 @@ hostfs_getattr(struct vnode *vp, struct vattr *attr)
+ 	attr->va_atime = times[0];
+ 	attr->va_mtime = times[1];
+ 	attr->va_ctime = times[2];
++	attr->va_uid = owner[0];
++	attr->va_gid = owner[1];
+ 
+ 	vp->v_size = size;
+ 	vp->v_mode = mode;
+@@ -580,12 +640,12 @@ hostfs_setattr(struct vnode *vp, struct vattr *attr)
+ /* ── mkdir ────────────────────────────────────────────────────────── */
+ 
+ static int
+-hostfs_mkdir(struct vnode *dvp, const char *name, mode_t mode __unused)
++hostfs_mkdir(struct vnode *dvp, const char *name, mode_t mode)
+ {
+ 	struct hostfs_node *dnp = dvp->v_data;
+ 	char path[1024];
+ 	int err;
+-	struct hl_param p[2];
++	struct hl_param p[3];
+ 	__s32 ret;
+ 
+ 	if (hostfs_stale(dnp))
+@@ -604,6 +664,12 @@ hostfs_mkdir(struct vnode *dvp, const char *name, mode_t mode __unused)
+ 	if (hl_hcall_int("fs_mkdir", p, 2, &ret) < 0)
+ 		return EIO;
+ 
++	if (ret < 0)
++		return -ret;
++	p[2].type = HL_PV_HLINT;
++	p[2].i32_val = mode;
++	if (hl_hcall_int("fs_chmod", p, 3, &ret) < 0)
++		return EIO;
+ 	return ret < 0 ? -ret : 0;
+ }
+ 
+@@ -862,11 +928,8 @@ hostfs_inactive(struct vnode *vp)
+ 
+ /* ── Stubs ────────────────────────────────────────────────────────── */
+ 
+-#define hostfs_open      ((vnop_open_t)vfscore_vop_nullop)
+-#define hostfs_close     ((vnop_close_t)vfscore_vop_nullop)
+ #define hostfs_seek      ((vnop_seek_t)vfscore_vop_nullop)
+ #define hostfs_ioctl     ((vnop_ioctl_t)vfscore_vop_einval)
+-#define hostfs_fsync     ((vnop_fsync_t)vfscore_vop_nullop)
+ #define hostfs_cache     ((vnop_cache_t)NULL)
+ #define hostfs_fallocate ((vnop_fallocate_t)vfscore_vop_einval)
+ #define hostfs_poll      ((vnop_poll_t)vfscore_vop_einval)
+diff --git a/lib/vfscore/fops.c b/lib/vfscore/fops.c
+index 2fdb672..52232d8 100644
+--- a/lib/vfscore/fops.c
++++ b/lib/vfscore/fops.c
+@@ -51,21 +51,19 @@ int vfs_close(struct vfscore_file *fp)
+ 	 * NOTE: We do this because on umount not all of our filesystem drivers
+ 	 * may flush cached contents.
+ 	 */
+-	error = VOP_FSYNC(vp, fp);
+-	if (unlikely(error))
+-		return error;
+-
+-	error = VOP_CLOSE(vp, fp);
++	error = (vp->v_flags & VNOCLOSESYNC) ? 0 : VOP_FSYNC(vp, fp);
++	{
++		int close_error = VOP_CLOSE(vp, fp);
++		if (!error)
++			error = close_error;
++	}
+ 	vn_unlock(vp);
+ 
+-	if (error)
+-		return error;
+-
+ 	/* Release the dentry */
+ 	drele(fp->f_dentry);
+ 	fp->f_dentry = NULL;
+ 
+-	return 0;
++	return error;
+ }
+ 
+ int vfs_read(struct vfscore_file *fp, struct uio *uio, int flags)
+@@ -80,7 +78,6 @@ int vfs_read(struct vfscore_file *fp, struct uio *uio, int flags)
+ 	vn_lock(vp);
+ 	if ((flags & FOF_OFFSET) == 0)
+ 		uio->uio_offset = fp->f_offset;
+-
+ 	error = VOP_READ(vp, fp, uio, 0);
+ 	if (!error) {
+ 		count = bytes - uio->uio_resid;
+@@ -99,10 +96,6 @@ int vfs_write(struct vfscore_file *fp, struct uio *uio, int flags)
+ 	struct vnode *vp = fp->f_dentry->d_vnode;
+ 	int ioflags = 0;
+ 	int error;
+-	size_t count;
+-	ssize_t bytes;
+-
+-	bytes = uio->uio_resid;
+ 
+ 	vn_lock(vp);
+ 
+@@ -114,12 +107,21 @@ int vfs_write(struct vfscore_file *fp, struct uio *uio, int flags)
+ 	if ((flags & FOF_OFFSET) == 0)
+ 		uio->uio_offset = fp->f_offset;
+ 
++	if (ioflags & IO_APPEND) {
++		struct vattr attr;
++
++		error = VOP_GETATTR(vp, &attr);
++		if (error) {
++			vn_unlock(vp);
++			return error;
++		}
++		uio->uio_offset = attr.va_size;
++	}
+ 	error = VOP_WRITE(vp, uio, ioflags);
+ 	if (!error) {
+-		count = bytes - uio->uio_resid;
+ 		if (!(flags & FOF_OFFSET) &&
+ 		    !(fp->f_vfs_flags & UK_VFSCORE_NOPOS))
+-			fp->f_offset += count;
++			fp->f_offset = uio->uio_offset;
+ 	}
+ 
+ 	vn_unlock(vp);
+diff --git a/lib/vfscore/include/vfscore/vnode.h b/lib/vfscore/include/vfscore/vnode.h
+index 871cf1b..ca9329a 100644
+--- a/lib/vfscore/include/vfscore/vnode.h
++++ b/lib/vfscore/include/vfscore/vnode.h
+@@ -101,6 +101,7 @@ struct vnode {
+ #define VROOT		0x0001		/* root of its file system */
+ #define VISTTY		0x0002		/* device is tty */
+ #define VPROTDEV	0x0004		/* protected device */
++#define VNOCLOSESYNC 0x0008	/* no kernel write cache to flush on close */
+ 
+ /*
+  * Vnode attribute
+diff --git a/lib/vfscore/main.c b/lib/vfscore/main.c
+index 2aff076..6a2672b 100644
+--- a/lib/vfscore/main.c
++++ b/lib/vfscore/main.c
+@@ -647,8 +647,10 @@ UK_SYSCALL_R_DEFINE(int, newfstatat, int, dirfd, const char*, path,
+ 	return __fxstatat_helper(1, dirfd, path, st, flags);
+ }
+ 
+-int vfscore_flock(struct vfscore_file *file __unused, int operation)
++int vfscore_flock(struct vfscore_file *file, int operation)
+ {
++	if (file->f_dentry->d_vnode->v_flags & VNOCLOSESYNC)
++		return -EOPNOTSUPP;
+ 	switch (operation) {
+ 	case LOCK_SH:
+ 	case LOCK_SH | LOCK_NB:
+@@ -1857,9 +1859,17 @@ int vfscore_fcntl(struct vfscore_file *fp, unsigned int cmd, unsigned long arg)
+ 		FD_UNLOCK(fp);
+ 		break;
+ 	case F_SETLK:
++		if (fp->f_dentry->d_vnode->v_flags & VNOCLOSESYNC) {
++			error = EOPNOTSUPP;
++			break;
++		}
+ 		uk_pr_warn_once("fcntl(F_SETLK) stubbed\n");
+ 		break;
+ 	case F_GETLK:
++		if (fp->f_dentry->d_vnode->v_flags & VNOCLOSESYNC) {
++			error = EOPNOTSUPP;
++			break;
++		}
+ 		uk_pr_warn_once("fcntl(F_GETLK) stubbed. Always unlocked\n");
+ 
+ 		struct flock *flk = (struct flock *)arg;
+@@ -1876,6 +1886,10 @@ int vfscore_fcntl(struct vfscore_file *fp, unsigned int cmd, unsigned long arg)
+ 
+ 		break;
+ 	case F_SETLKW:
++		if (fp->f_dentry->d_vnode->v_flags & VNOCLOSESYNC) {
++			error = EOPNOTSUPP;
++			break;
++		}
+ 		uk_pr_warn_once("fcntl(F_SETLKW) stubbed\n");
+ 		break;
+ 	case F_SETOWN:

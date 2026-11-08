@@ -1,0 +1,69 @@
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 5798b62..ec8e292 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -69,6 +69,12 @@
+ #include <signal.h>
+ #include <time.h>
+ #include <sys/wait.h>
++#ifdef HYPERLIGHT_UNIKRAFT
++#include <spawn.h>
++#ifndef EXEC_BACKEND
++#error HYPERLIGHT_UNIKRAFT requires EXEC_BACKEND
++#endif
++#endif
+ #include <ctype.h>
+ #include <sys/stat.h>
+ #include <sys/socket.h>
+@@ -1541,12 +1547,16 @@ getInstallationPaths(const char *argv0)
+ 				(errmsg("%s: could not locate my own executable path", argv0)));
+ 
+ #ifdef EXEC_BACKEND
++#ifdef HYPERLIGHT_UNIKRAFT
++	strlcpy(postgres_exec_path, my_exec_path, MAXPGPATH);
++#else
+ 	/* Locate executable backend before we change working directory */
+ 	if (find_other_exec(argv0, "postgres", PG_BACKEND_VERSIONSTR,
+ 						postgres_exec_path) < 0)
+ 		ereport(FATAL,
+ 				(errmsg("%s: could not locate matching postgres executable",
+ 						argv0)));
++#endif
+ #endif
+ 
+ 	/*
+@@ -4595,6 +4605,26 @@ internal_forkexec(int argc, char *argv[], Port *port)
+ 	/* Insert temp file name after --fork argument */
+ 	argv[2] = tmpfilename;
+ 
++#ifdef HYPERLIGHT_UNIKRAFT
++	{
++		int			rc;
++
++		fflush(NULL);
++		rc = posix_spawn(&pid, postgres_exec_path, NULL, NULL, argv, environ);
++		if (rc != 0)
++		{
++			if (unlink(tmpfilename) != 0)
++				ereport(LOG,
++						(errmsg("could not remove child parameter file \"%s\": %m",
++								tmpfilename)));
++			errno = rc;
++			ereport(LOG,
++					(errmsg("could not spawn server process \"%s\": %m",
++							postgres_exec_path)));
++			return -1;
++		}
++	}
++#else
+ 	/* Fire off execv in child */
+ 	if ((pid = fork_process()) == 0)
+ 	{
+@@ -4607,6 +4637,7 @@ internal_forkexec(int argc, char *argv[], Port *port)
+ 			exit(1);
+ 		}
+ 	}
++#endif
+ 
+ 	return pid;					/* Parent returns pid, or -1 on fork failure */
+ }
