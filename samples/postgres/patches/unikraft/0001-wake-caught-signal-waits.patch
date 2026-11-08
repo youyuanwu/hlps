@@ -1,0 +1,97 @@
+diff --git a/lib/posix-process/signal/signal.c b/lib/posix-process/signal/signal.c
+index d98e19d..373907e 100644
+--- a/lib/posix-process/signal/signal.c
++++ b/lib/posix-process/signal/signal.c
+@@ -228,11 +228,31 @@ void pthread_signal_pause(struct posix_thread *pthread)
+ 	pthread->state = POSIX_THREAD_RUNNING;
+ }
+ 
++static bool pthread_signal_interrupt(struct posix_thread *thread)
++{
++	struct uk_thread *t = thread->thread;
++
++	if (!t || uk_thread_is_exited(t) ||
++	    thread->state == POSIX_THREAD_BLOCKED_VFORK)
++		return false;
++	if (t == uk_thread_current())
++		return true;
++	uk_thread_set_interrupted(t);
++	if (thread->state == POSIX_THREAD_BLOCKED_WAIT)
++		uk_semaphore_up(&thread->process->wait_semaphore);
++	else if (thread->state == POSIX_THREAD_BLOCKED_SIGNAL)
++		uk_semaphore_up(&thread->signal->deliver_semaphore);
++	else if (!uk_thread_is_runnable(t))
++		uk_thread_wake(t);
++	return true;
++}
++
+ int pprocess_signal_send(struct posix_process *proc, int signum,
+ 			 siginfo_t *siginfo)
+ {
+ 	struct posix_thread *thread, *threadn;
+ 	struct uk_signal *sig;
++	bool caught, interrupted = false;
+ 	int rc;
+ 
+ 	/* A standard signal pending already stands for this one (see
+@@ -269,11 +289,15 @@ int pprocess_signal_send(struct posix_process *proc, int signum,
+ 	pprocess_signal_files_notify(proc, signum);
+ #endif /* CONFIG_LIBPOSIX_PROCESS_SIGNALFD */
+ 
+-	/* Wake up any threads that may be paused, in sigsuspend() or pause(),
+-	 * whoever sent the signal: a SIGCHLD from an exiting child included.
++	/* A caught signal must also unwind blocking I/O so its handler runs.
++	 * Interrupt only one eligible thread for a process-directed signal.
+ 	 */
++	caught = KERN_SIGACTION(proc, signum)->ks_handler != SIG_DFL &&
++		 KERN_SIGACTION(proc, signum)->ks_handler != SIG_IGN;
+ 	uk_pprocess_foreach_pthread(proc, thread, threadn) {
+-		if (pthread_signal_wakes(proc, thread, signum))
++		if (caught && !interrupted && !IS_MASKED(thread, signum))
++			interrupted = pthread_signal_interrupt(thread);
++		else if (!caught && pthread_signal_wakes(proc, thread, signum))
+ 			uk_semaphore_up(&thread->signal->deliver_semaphore);
+ 	}
+ 
+@@ -314,26 +338,9 @@ static bool pprocess_signal_is_fatal(struct posix_process *pproc, int signum)
+ void pprocess_signal_interrupt(struct posix_process *pproc)
+ {
+ 	struct posix_thread *thread, *threadn;
+-	struct uk_thread *t;
+ 
+-	uk_pprocess_foreach_pthread(pproc, thread, threadn) {
+-		t = thread->thread;
+-		if (!t || t == uk_thread_current() || uk_thread_is_exited(t))
+-			continue;
+-		/* A vfork parent's stack is the running child's until the
+-		 * child execs or exits, which wakes the parent.
+-		 */
+-		if (thread->state == POSIX_THREAD_BLOCKED_VFORK)
+-			continue;
+-		uk_thread_set_interrupted(t);
+-		if (thread->state == POSIX_THREAD_BLOCKED_WAIT)
+-			uk_semaphore_up(&pproc->wait_semaphore);
+-		/* Paused, possibly with the fatal signal blocked */
+-		else if (thread->state == POSIX_THREAD_BLOCKED_SIGNAL)
+-			uk_semaphore_up(&thread->signal->deliver_semaphore);
+-		else if (!uk_thread_is_runnable(t))
+-			uk_thread_wake(t);
+-	}
++	uk_pprocess_foreach_pthread(pproc, thread, threadn)
++		pthread_signal_interrupt(thread);
+ }
+ 
+ /* @signum ends @pproc: decided now, as Linux does when it sends a fatal
+@@ -584,7 +591,11 @@ int pprocess_signal_thread_do(int tid, int signum, siginfo_t *siginfo)
+ 	}
+ 
+ queued:
+-	if (pthread_signal_wakes(pproc, pthread, signum))
++	if (!IS_MASKED(pthread, signum) &&
++	    KERN_SIGACTION(pproc, signum)->ks_handler != SIG_DFL &&
++	    KERN_SIGACTION(pproc, signum)->ks_handler != SIG_IGN)
++		pthread_signal_interrupt(pthread);
++	else if (pthread_signal_wakes(pproc, pthread, signum))
+ 		uk_semaphore_up(&pthread->signal->deliver_semaphore);
+ 	/* To a thread or not, a signal that ends the process ends it now;
+ 	 * sent to a thread, only if that thread takes it.

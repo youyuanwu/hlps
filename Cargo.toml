@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*", "samples/c-guest/host", "samples/c-guest/native", "samples/benchmark"]
+exclude = ["target/postgres-experiment/sources/hyperlight-unikraft"]
 resolver = "3"
 
 [workspace.package]

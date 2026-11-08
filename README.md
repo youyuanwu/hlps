@@ -9,6 +9,9 @@ Small experiments with [Hyperlight](https://github.com/hyperlight-dev/hyperlight
   same guest into a native Rust subprocess or directly into its host without KVM.
 - [Three-mode benchmarks](samples/benchmark/README.md): shared C workloads,
   Criterion steady-state measurements, and lifecycle/per-call latency CSV.
+- [PostgreSQL experiment](samples/postgres/README.md): pinned Hyperlight-Unikraft
+  baseline and process probes; [the plan](samples/postgres/PLAN.md) covers the
+  later PostgreSQL port, spill, and durability validation.
 
 ## Rust workspace
 
