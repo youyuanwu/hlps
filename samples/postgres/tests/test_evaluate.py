@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,22 @@ import evaluate
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_original_benchmark_still_requires_matching_client_build(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(evaluate, "DATA", Path(temporary)), \
+                patch.object(evaluate, "verify_server", return_value={"server": "sha"}) as server, \
+                patch.object(evaluate, "client_inputs", return_value={"source": "sha"}), \
+                patch.object(evaluate.runtime, "digest", return_value="binary-sha"):
+            metadata = {"inputs": {"source": "sha"}, "client_sha256": "binary-sha"}
+            path = Path(temporary) / "build.json"
+            path.write_text(json.dumps(metadata))
+            self.assertEqual(evaluate.verify(), {"server": "sha"})
+            server.assert_called_once()
+            for change in ({"inputs": {"source": "stale"}}, {"client_sha256": "stale"}):
+                path.write_text(json.dumps(dict(metadata, **change)))
+                with self.assertRaisesRegex(RuntimeError, "benchmark-build"):
+                    evaluate.verify()
+
     def test_nearest_rank_percentiles_and_invalid_samples(self):
         values = list(range(100, 0, -1))
         self.assertEqual(evaluate.quantile(values, 50), 50)

@@ -17,11 +17,11 @@ copyright/license notices remain in the pinned source.
   refuses undecodable names instead of skipping them.
 - Public capability-confined `DirBackend::open` for the experiment's observed
   and quota-limited wrapper. All operations remain beneath its directory.
-- A host snapshot-contract bump. No experiment profile restores snapshots.
+- Snapshot-contract version 9. No sample profile restores snapshots.
 
-Existing `fs_list` remains registered for old callers. New guest kernels
-require the appended stat fields and new host functions; build both together.
-New pages are stable while a directory is unchanged. Modifying a directory
+The host registers both `fs_list` and `fs_list_page`. The guest kernel
+requires the matching stat fields and host functions; build both together.
+Pages are stable while a directory is unchanged. Modifying a directory
 during enumeration is not a snapshot of that directory.
 
 Tests: directory backend sync and confinement, 5,000-entry bounded pagination,

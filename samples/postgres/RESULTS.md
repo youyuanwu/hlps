@@ -1,213 +1,365 @@
-# PostgreSQL evaluation: 2026-11-08
+# PostgreSQL release-build evaluation: 2026-11-10
 
-**All targeted evaluation checks passed**: three serial repeats of native
-PostgreSQL 16.15 and the Hyperlight-Unikraft guest, plus a separate profiled
-guest run. The persistent-storage/recovery prerequisite also passed.
+**All comparisons use optimized release hosts and equivalent PostgreSQL
+assertion settings.** Six serial SQL/spill runs, a separate filesystem diagnostic,
+and 72 standard-client read scans passed, along with the runtime, SQL,
+storage, and fresh-VM recovery checks.
 
-## Demonstrated results
+## Summary
 
-- Median warmed `SELECT 1`: **49.8 us native / 411.3 us guest**, about 8.3x.
-- Median indexed lookup: **64.6 us / 685.8 us**, about 10.6x.
-- Median synchronous update: **3.20 ms / 4.31 ms**, about 1.35x.
-- Median spill checksum: **203 ms / 4,975 ms**, about 24.5x.
-- Sampled server-tree PSS: **51.1 MiB native / 135.9 MiB guest**.
-- Filesystem callback body time is dominated by writes in the diagnostic.
+| Workload / metric | Native | Hyperlight guest | Guest/native |
+|-------------------|-------:|-----------------:|-------------:|
+| SELECT 1 median | 50.910 us | 123.108 us | 2.42x latency |
+| Indexed lookup median | 63.764 us | 201.914 us | 3.17x latency |
+| Synchronous update median | 3.257 ms | 3.779 ms | 1.16x latency |
+| Spill checksum median | 203.016 ms | 2,003.290 ms | 9.87x latency |
+| Repeated pgbench table SELECT | 310.54 MB/s | 67.73 MB/s | 4.59x lower throughput |
+| Repeated psql binary COPY | 308.55 MB/s | 64.13 MB/s | 4.81x lower throughput |
+| Repeated aggregate scan median | 27.219 ms | 73.941 ms | 2.72x latency |
 
-**The sample successfully executes real PostgreSQL SQL, disk spilling,
-synchronization, and fresh-VM recovery within the tested limits.** The current
-audited development-build storage path is expensive, especially for spilling.
-These results are not a production readiness certification. Optional features,
-snapshots, full POSIX descriptor/locking semantics, and physical power-loss
-durability remain unvalidated or unsupported.
+The sample successfully runs real PostgreSQL, synchronized persistent data,
+disk spilling, and fresh-VM recovery. It is not a production or physical
+power-loss durability certification. These ratios compare **complete stacks**,
+not isolated Hyperlight transition costs.
 
-These ratios compare the **complete experimental stacks**, not Hyperlight's
-isolation cost alone. Native PostgreSQL is unmodified and uses glibc/fork;
-the guest uses musl, EXEC_BACKEND/posix_spawn, assertions, and the patched
-single-address-space kernel. Its Rust host is unoptimized and every relevant
-storage mutation is audited/accounted. Native has no equivalent host audit.
-Do not extrapolate these measurements to an optimized or production port.
-
-## Environment and procedure
+## Build equivalence and environment
 
 | Setting | Value |
 |---------|-------|
-| Measurement window | 2026-11-08, 18:14:03 to 18:16:38 UTC |
-| Host virtualization | Microsoft full virtualization; Hyperlight KVM is nested |
+| SQL/spill window | 2026-11-10, 06:34:25-06:35:41 UTC |
+| Read window | 2026-11-10, 06:35:41-06:36:12 UTC |
+| Host | Microsoft full virtualization; Hyperlight KVM therefore runs nested |
 | CPU | Intel Xeon Platinum 8573C; 2 exposed logical CPUs, 1 core / 2 threads |
-| Affinity | Every server CPU 0; benchmark client and sampler CPU 1 |
-| Frequency/load control | `schedutil`; no frequency/turbo or neighbor-load control |
-| Kernel / RAM | Linux `7.0.0-1019-azure`; 7.7 GiB RAM, no swap |
-| Storage | `/data` on ext4, `/dev/sdb1`, `rw,relatime`; underlying device performance not controlled |
-| PostgreSQL | 16.15, native source unmodified; pinned target-guarded guest patches |
-| Compiler/runtime | GCC 15.2.0; glibc 2.43 native/client; musl 1.2.5 guest |
-| Rust / host build | Rust 1.93.1; development profile, debug=0, opt-level=0 |
-| PostgreSQL/client flags | `-O2 -march=x86-64`; guest assertions enabled, native assertions disabled |
-| Synchronization | `fsync=on`, `synchronous_commit=on`, WAL method `fsync` |
-| Memory/worker profile | Shared buffers 16 MiB, work_mem 64 KiB; max connections 2; optional workers/parallelism/autovacuum disabled |
-| Source base | `77973d6` plus the evaluation changes; exact pins in [sources.toml](sources.toml) |
-| Cache conditions | Fresh server processes, retained host page cache, fixture/EXPLAIN/checkpoint preparation, per-workload warm-up |
+| Affinity | Every server CPU 0; client and sampler CPU 1 |
+| Frequency policy | `schedutil`; no frequency/turbo or neighbor-load control |
+| Kernel / memory | Linux `7.0.0-1019-azure`; 7.7 GiB RAM, no swap |
+| Filesystem | `/data` on ext4, `/dev/sdb1`, `rw,relatime` |
+| PostgreSQL | 16.15; native source unmodified; pinned target-guarded guest patches |
+| GCC / libc | GCC 15.2.0; glibc 2.43 native/client; musl 1.2.5 guest |
+| Rust host | Rust 1.93.1, `cargo --release`, opt-level=3, debug=0 |
+| Rust checks | Debug assertions/overflow checks disabled; incremental compilation disabled |
+| PostgreSQL/client flags | `-O2 -march=x86-64`; PostgreSQL assertions disabled in **both** builds |
+| Kernel build | Performance-optimized Unikraft configuration |
+| Durability | `fsync=on`, `synchronous_commit=on`, `wal_sync_method=fsync` |
+| Server profile | Shared buffers 16 MiB; work_mem 64 KiB; max connections 2; optional workers/parallelism/autovacuum disabled |
+| Source identities | [sources.toml](sources.toml) and per-run script/build hashes |
 
-Modes ran sequentially in native/guest, guest/native, native/guest order.
-No native server and guest VM overlapped. Host CPU 0 and client CPU 1 are
-sibling threads: this is not an independent two-core allocation or an SMP
-benchmark. Affinity was verified while sampling and restored afterward.
-One-minute host load increased from 0.57 to 1.73, including the suite's own
-activity. Shared-host scheduling and cache conditions remain uncontrolled.
+Build metadata records the actual verified Cargo settings, PostgreSQL configure
+arguments, configuration-header hashes, and executable/rootfs identities.
+Packaging and measurements require verified release host metadata, matching
+artifacts, and PostgreSQL assertions disabled in both builds. Ordinary
+validation/test assertions are enabled. Generated PostgreSQL headers are
+explicitly built before server compilation under the outer Makefile.
 
-Both modes recreate the same 100,000-row C-locale fixture, unique ID index,
-and one-row update table before each repeat. Existing dedicated PGDATA/WAL
-directories are reused; initialization history and other gate tables are
-not byte-identical. Preparation is outside query timing and deliberately
-warms caches. No reboot, global cache drop, snapshot, or live data clone.
+**Instrumentation differs between modes:** hostfs mutation audits,
+quota accounting, storage ownership, and real synchronization are enabled;
+native PostgreSQL has no equivalent hostfs audit. Profiling is off in measured
+runs and on only in a separate diagnostic. Native uses glibc/fork and the guest
+uses musl/EXEC_BACKEND/posix_spawn and the single-address-space kernel. Release
+mode does not make these execution paths identical or isolate virtualization.
 
-The [C client](tests/query-client.c) uses native libpq and CLOCK_MONOTONIC.
-Latency includes synchronous `PQexec`/protocol completion but excludes exact
-result validation and CSV output. Each short workload has 50 untimed calls,
-then 1,000 selects/lookups or 300 updates. Spilling has one untimed call and
-five timed calls per repeat. Throughput is calls divided by whole measured
-batch time, including loop/result-validation overhead and excluding CSV.
-It is single-client closed-loop throughput, not saturation capacity.
+Modes run serially in native/guest, guest/native, native/guest order. The CPUs
+are sibling threads, not two independent physical cores. No build or second
+server ran concurrently with the measurements. One-minute load was 1.33 before
+SQL / 1.51 afterward, then 1.34 after reads. Shared-host scheduling and physical
+storage/cache conditions are not controlled.
 
-## Startup and first benchmark connection
+## SQL and spill procedure
 
-All times are milliseconds, reported as **median [min, max]**, three samples
-per mode.
+Both servers recreate the same 100,000-row C-locale fixture, unique ID index,
+and one-row update table before each repeat. Dedicated PGDATA/WAL directories
+are reused, not byte-identical clones. Preparation, EXPLAIN, and checkpointing
+are outside query timing and warm caches; the host page cache is retained.
+
+The [libpq timing client](tests/query-client.c) measures synchronous
+`PQexec` completion, excluding result validation and CSV output. Short
+workloads have 50 untimed calls followed by 1,000 selects/lookups or 300
+autocommit updates. Spilling has one untimed and five measured checksums.
+Every result is checked. Batch throughput includes loop/result-validation
+cost but excludes CSV output; it is single-client closed-loop throughput.
+
+### Startup and first benchmark connection
+
+Milliseconds, **median [min, max]**, three samples per mode:
 
 | Metric | Native | Guest |
 |--------|-------:|------:|
-| Launch to observed readiness | 114.972 [114.864, 115.107] | 451.969 [449.268, 454.324] |
-| First benchmark connection | 7.212 [6.424, 7.463] | 44.013 [42.175, 44.199] |
-| First benchmark SELECT 1 | 0.158 [0.154, 0.164] | 0.698 [0.684, 0.833] |
+| Launch to observed readiness | 114.933 [114.678, 115.236] | 376.589 [355.837, 521.951] |
+| First benchmark connection | 7.464 [6.431, 8.852] | 22.627 [22.419, 23.729] |
+| First benchmark SELECT 1 | 0.165 [0.156, 0.166] | 0.429 [0.406, 0.453] |
 
 Startup includes launch wrappers, guest boot/ownership probes where relevant,
-and host `pg_isready` polling at approximately 100 ms intervals. It excludes
-builds and database initialization, and is **observed end-to-end readiness**,
-not intrinsic PostgreSQL boot time. First connection/query timings occur
-after readiness probes and fixture preparation; they are not cold-cache or
-first-ever cluster queries. Three samples do not establish startup tails.
+and approximately 100 ms readiness polling. It excludes build/initialization
+and is not intrinsic kernel boot time. Benchmark connection/query timings
+follow readiness probes and fixture preparation, not cold-cache or first-ever
+cluster access. Three samples do not establish startup tails.
 
-## Warmed SQL latency and throughput
+### Warmed latency and throughput
 
-Latency values are **microseconds**, pooled across the three main repeats.
-Percentiles use nearest rank. No confidence interval or universal tail claim
-is inferred from this finite, scheduling-dependent run.
+Latency values are **microseconds**, pooled across three repeats using
+nearest-rank percentiles. No confidence interval or universal tail claim is
+inferred from this finite, scheduling-dependent run.
 
 | Workload | Mode | Samples | p50 | p95 | p99 | Calls/s |
 |----------|------|--------:|----:|----:|----:|--------:|
-| SELECT 1 | Native | 3,000 | 49.756 | 65.121 | 110.754 | 18,865.9 |
-| SELECT 1 | Guest | 3,000 | 411.324 | 460.915 | 914.325 | 2,301.4 |
-| Indexed lookup | Native | 3,000 | 64.551 | 94.422 | 709.018 | 11,577.4 |
-| Indexed lookup | Guest | 3,000 | 685.826 | 983.486 | 1,995.103 | 1,400.6 |
-| Synchronous update | Native | 900 | 3,201.173 | 4,322.581 | 6,157.061 | 300.5 |
-| Synchronous update | Guest | 900 | 4,313.421 | 5,626.302 | 8,099.983 | 222.3 |
+| SELECT 1 | Native | 3,000 | 50.910 | 64.407 | 84.622 | 19,213.0 |
+| SELECT 1 | Guest | 3,000 | 123.108 | 151.655 | 276.835 | 7,624.7 |
+| Indexed lookup | Native | 3,000 | 63.764 | 86.714 | 167.295 | 14,124.6 |
+| Indexed lookup | Guest | 3,000 | 201.914 | 292.294 | 624.789 | 4,497.7 |
+| Synchronous update | Native | 900 | 3,257.106 | 4,279.890 | 6,143.833 | 294.7 |
+| Synchronous update | Guest | 900 | 3,778.807 | 5,341.320 | 7,052.453 | 249.3 |
 
-Lookups select deterministically distributed IDs and verify ID, payload length,
-and exact payload content. Each implicit-transaction update increments one
-counter and validates every returned value, including warm-up. Synchronous
-commit completes before `PQexec` returns; the final counter is exactly 350.
-Each guest audit contains **360 successful real WAL fsyncs** across the whole
-run, including startup/preparation/checkpoint, with no host operation errors.
+Lookup IDs and payloads are deterministic and checked. Each update validates
+the exact returned counter, ending at 350 including warm-up. Every guest audit
+contains **360 successful OS WAL fsyncs** across startup/preparation/updates/
+checkpoint/shutdown, with no failed host operations.
 
-Between-repeat median ranges were 41.454-51.897 us native / 409.404-412.847 us
-guest for SELECT, 63.409-65.731 / 685.208-687.152 us for lookup, and
-3.049-3.271 / 4.230-4.419 ms for updates. Native lookup throughput varied
-from **8,136.6 to 14,784.4 calls/s**, despite relatively stable medians.
-This is why throughput must not be inferred from median latency or treated
-as a machine-independent result.
+Between-repeat median ranges were 49.531-51.802 us native /
+122.571-123.983 us guest for SELECT, 63.187-64.560 / 198.519-204.916 us for
+lookup, and 3.197-3.301 / 3.754-3.802 ms for updates. Native lookup throughput
+varied from 12,483.9 to 15,133.1 calls/s. Throughput must not be inferred from
+median latency.
 
-## Disk spilling and correctness
+### Disk spilling
 
-Every timed checksum equals the independent Python/native expectation:
-`6d334d76c6d5153bbf8eebf552f99702`.
+Every full ordered-result checksum equals
+`6d334d76c6d5153bbf8eebf552f99702`, matching native and independent expectations.
 
-| Measurement | Native | Guest |
-|-------------|-------:|------:|
-| Timed full ordered-result checksums | 15 | 15 |
-| Median checksum, ms | 203.145 | 4,975.069 |
-| Observed p95/max checksum, ms | 227.288 | 5,029.065 |
-| Checksum calls/s | 4.804 | 0.201 |
-| EXPLAIN disk sort space, KiB | 27,280 | 27,272 |
-| Actual temp blocks read / written | 13,614 / 14,334 | 13,610 / 14,352 |
+| Metric | Native | Guest |
+|--------|-------:|------:|
+| Timed checksums | 15 | 15 |
+| Median, ms | 203.016 | 2,003.290 |
+| Observed p95/max, ms | 215.418 | 2,018.787 |
+| Checksums/s | 4.891 | 0.499 |
+| EXPLAIN disk sort, KiB | 27,280 | 27,280 |
+| Temp blocks read / written | 13,614 / 14,334 | 13,614 / 14,334 |
 
-The plan requires a disk sort with exactly 100,000 actual rows and nonzero
-temp reads/writes. These are measured fields, not an inference from low
-work_mem. Temp files are absent after the run. With only 15 spill samples
-per mode, p95 and p99 both select the maximum and are not reliable tail
-estimates. This is an ordered-sort-plus-checksum workload, not raw disk
-bandwidth or a general SQL throughput benchmark.
+JSON EXPLAIN requires a disk sort, exactly 100,000 actual rows, and nonzero
+temp reads/writes. Temp files are absent afterward. With 15 samples per mode,
+p95 and p99 both select the maximum; they are not reliable tail estimates.
+This is sort-plus-checksum work, not raw disk bandwidth.
 
-## Resource use
+### SQL/spill resource use
 
-| Measurement | Native | Guest |
-|-------------|-------:|------:|
-| Sampled server-tree peak PSS, KiB | 52,293 | 139,121 |
-| Sampled sum RSS, KiB | 87,832 | 140,936 |
-| Maximum sampled server process count | 5 | 1 host process |
-| Largest post-shutdown logical storage, bytes | 58,683,194 | 58,811,080 |
-| Post-shutdown WAL bytes | 16,777,216 | 16,777,216 |
+| Metric | Native | Guest |
+|--------|-------:|------:|
+| Sampled peak server-tree PSS, KiB | 52,441 | 135,916 |
+| Sampled sum RSS, KiB | 84,456 | 137,732 |
+| Maximum server process count | 5 | 1 host process |
+| Maximum post-shutdown logical storage, bytes | 58,839,630 | 75,776,713 |
+| Maximum post-shutdown WAL bytes | 16,777,216 | 33,554,432 |
 
-PSS is summed across the native postmaster/children to avoid shared-page
-double counting; summed native RSS is not a physical-memory total. Guest
-figures include the host and resident guest mappings, but not the benchmark
-client. Sampling starts after readiness, covers preparation/SQL, runs every
-50 ms, and cannot prove instantaneous peaks. No child-exit sampling race was
-observed in these repeats.
+Native summed RSS double-counts shared pages; PSS is the better physical-memory
+comparison. Guest figures include resident guest mappings and host, not the
+client. Sampling starts after readiness, covers preparation/SQL every 50 ms,
+and cannot prove instantaneous peaks. No child-exit sampling race was observed.
 
-Guest audited logical storage high-water reached **86,706,372 bytes**
-(about 82.7 MiB), below 512 MiB. This includes spill growth, unlike the
-post-shutdown table above. Native temp space is evidenced by EXPLAIN and
-temp-file cleanup, not a sampled whole-directory high-water measurement.
-Logical budgets exclude physical inode/allocation overhead and outside-mount
-audit/build artifacts. Guest scratch stays capped at 512 MiB and host/tree
-memory checks at 1 GiB.
+Guest audited storage high-water was **103,680,197 bytes**, below 512 MiB.
+Unlike final storage, that includes spill growth. Native temporary usage is
+evidenced by EXPLAIN/cleanup, not a sampled whole-directory high-water.
+The servers use separate PGDATA/WAL directories with different retained WAL
+segment counts; final storage is not a controlled footprint benchmark. Logical budgets omit
+physical allocation/inode overhead and outside-mount logs/builds.
 
 ## Guest-to-host filesystem diagnostic
 
-The separate reduced profiled run is excluded from the latency tables. It
-includes boot, fixture/EXPLAIN preparation, 10 warm-up and 50 timed calls for
-each short workload, two checksum calls including warm-up, checkpoint, and
-shutdown. Its filesystem profile records **100,395 callbacks**, totaling
-**5,779.672 ms of callback body time**:
+The separate reduced profiled run includes boot, fixture/EXPLAIN preparation,
+10 warm-up and 50 measured calls per short workload, two checksum calls
+including warm-up, checkpoint, and shutdown. It is excluded from the latency
+tables. It records **100,275 filesystem callbacks** and **4,140.075 ms** of
+callback body time:
 
 | Callback | Calls | Total ms | Mean us |
 |----------|------:|---------:|--------:|
-| fs_write_bytes | 48,463 | 4,642.143 | 95.8 |
-| fs_read_bytes | 50,830 | 424.024 | 8.3 |
-| fs_sync | 147 | 672.880 | 4,577.4 |
-| fs_stat | 832 | 9.860 | 11.9 |
-| fs_list_page | 55 | 12.311 | 223.8 |
+| fs_write_bytes | 48,406 | 3,151.731 | 65.1 |
+| fs_read_bytes | 50,841 | 202.010 | 4.0 |
+| fs_sync | 147 | 760.289 | 5,172.0 |
+| fs_stat | 758 | 2.571 | 3.4 |
+| fs_list_page | 55 | 6.890 | 125.3 |
 
-Writes account for about 80% of filesystem callback body time. This supports
-investigating the path-based backend, repeated metadata/accounting, auditing,
-and transport granularity before expanding features. It does **not** prove
-which optimization would help or how fast an optimized port would be.
+Writes account for about 76% of callback body time in this diagnostic.
+That body includes backend/accounting/audit work but **excludes VM exit/reentry**
+and some marshalling. Totals also include preparation/shutdown. They neither
+measure pure transition overhead nor profile the read-only benchmark directly.
+The stateless backend reopens/seeks/closes files per request. These measurements
+do not establish the contribution of that behavior to the total query latency.
 
-The existing upstream profiler times host callback bodies. These include
-backend calls, quota/accounting, and audit serialization/writes, while excluding
-VM exit/reentry and some argument marshalling. Whole-life totals also include
-preparation and shutdown: they are not per-query I/O costs. Neither subtracting
-native latency nor this profile isolates pure Hyperlight overhead.
+## Full-table read throughput (2026-11-10)
 
-## Reproducibility and remaining limits
+**All 72 scans passed** using standard pgbench 16.15 for SELECT/aggregate and
+psql 16.15 for binary COPY. No custom read client/parser/build step is used.
+Every mode/workload/repeat boots a separate server, then runs one first and
+three subsequent scans on the same connection. Preparation occurs in separate
+server lifetimes; no fixture scan precedes the first timed sample.
 
-Run [the documented benchmark targets](README.md#performance).
-The successful raw run is
-`target/postgres-experiment/phase5/20261108T181403.037139Z/`, with per-query
-CSVs, EXPLAIN JSON, logs, diagnostic profile, and versioned `results.json`.
-The top-level benchmark result records current script/client/host/rootfs/native
-tool hashes and exact source pins; generated artifacts and credentials remain
-ignored. No PostgreSQL compatibility patch was added for evaluation.
+The 100,000-row fixture contains four-byte IDs and 128-byte values:
+**13.2 MB logical payload per transfer**. pgbench consumes complete SELECT
+results through custom SQL scripts with `-n -c 1 -j 1 -s 1 -M simple -t 4 -l`;
+it does not print rows or need pgbench tables. psql uses `\timing on` and
+`\o /dev/null` for binary COPY.
 
-Validation for this measured run: **25 Python tests, seven targeted Rust tests,
-C compilation with warnings denied, Clippy with warnings denied**, persistent
-storage/SQL validation, and SQL-time WAL faults/fresh-VM recovery. These checks
-are retained under the descriptive scripts and targets in the sample README.
-No server or storage
-ownership lock is deliberately left held afterward.
+| Workload | Mode | First median ms | Repeated median ms | Repeated MB/s | Repeated rows/s |
+|----------|------|----------------:|-------------------:|--------------:|----------------:|
+| pgbench SELECT | Native | 55.953 | 43.331 | 310.54 | 2,352,597 |
+| pgbench SELECT | Guest | 206.172 | 194.157 | 67.73 | 513,079 |
+| psql binary COPY | Native | 47.568 | 42.488 | 308.55 | 2,337,505 |
+| psql binary COPY | Guest | 210.417 | 205.961 | 64.13 | 485,808 |
 
-Recovery evidence is limited to owned-host SIGKILL and injected WAL write/
-sync EIO/EDQUOT with the host OS page cache intact. A failed sync can leave an
-unacknowledged transaction recoverable: applications must handle the unknown
-commit outcome. This is not physical power-loss, torn-write, production,
-replication, SMP, or live-snapshot validation. Keep optional features disabled
-in the validated configuration.
+There are three first-scan and nine repeated samples per row. Rates use total
+logical bytes or rows divided by total elapsed time, not reciprocal median.
+MB is decimal 1,000,000 bytes, not TCP/protocol wire bandwidth. Repeated
+SELECT ranges were 34.663-44.323 ms native / 192.774-201.593 ms guest; COPY
+ranges were 41.968-44.312 / 204.507-208.086 ms. These finite samples do not
+establish reliable p99s.
+
+Timing comes directly from pgbench transaction logs and psql COPY timings,
+at microsecond resolution. Connection/startup and correctness checks are
+excluded. There is **no first-row metric or per-row validation inside timing**.
+pgbench/libpq can buffer a full result; psql handles COPY streaming.
+
+After timing, each run verifies the exact aggregate and exports rows ordered
+by ID through untimed psql binary COPY. All **14,200,021 output bytes** must
+match independent SHA-256
+`d1f6015927ccbe4bc4571f4aa5f67c51be6da21fc2a303e246b6b82656f6af50`.
+The temporary file is deleted after success. This checks every row/payload
+in a separate transfer, not every timed pgbench result or COPY byte.
+
+### Scan control and buffer behavior
+
+The pgbench control query `SELECT count(*),sum(length(value)) FROM spill_fixture`
+returns only `100000,12800000`, checked outside timing:
+
+| Metric | Native | Guest |
+|--------|-------:|------:|
+| First-scan median, ms | 28.659 | 78.075 |
+| Repeated median, ms | 27.219 | 73.941 |
+| Repeated scanned rows/s | 3,607,938 | 1,355,887 |
+
+The aggregate is about 2.72x slower by median, whereas returning all rows has
+a larger gap. This is consistent with scan-side and result-delivery costs,
+but the control also computes text lengths; subtracting it does not isolate
+network or transition overhead.
+
+Heap-statistic snapshots around each complete four-scan client show
+**8,000 read blocks / 192 hits** in both modes and all workloads. These are
+combined, untimed counters after client disconnect and before correctness
+queries, not per-transaction measurements.
+
+The heap is 16 MiB at 8 KiB per block. Under the 16 MiB shared-buffer profile,
+the repeated scans do not retain the entire heap. **Repeated/warmed does not
+mean all-buffer-hit.** PostgreSQL buffer misses do not prove physical-disk
+reads: the host page cache is retained and warmed by setup and repeated scans.
+No global cache manipulation or cold-disk claim is made.
+
+Post-timing JSON EXPLAIN ANALYZE requires one serial 100,000-row Seq Scan,
+positive buffer evidence, and no Gather/Sort/temp writes. COPY uses the
+equivalent SELECT plan. Instrumented plan time is not streamed-result time.
+
+### Cache-hit control: separating storage and result delivery
+
+A cache-hit diagnostic on **2026-11-10 at approximately 06:45 UTC** keeps the
+same 100,000 rows entirely in PostgreSQL's session-local buffers. It used the
+same release binaries, server/client CPU affinity, serial native/guest
+execution, and standard psql client. Preparation uses session-local temporary
+data without modifying persistent data or configuration.
+
+Each workload used its own session, with preparation outside timing:
+
+```sql
+SET temp_buffers = '32MB';
+CREATE TEMP TABLE cache_control AS
+SELECT id, value FROM spill_fixture;
+```
+
+The session then ran either the aggregate or binary COPY four times, using
+psql `\timing` and directing output to `/dev/null`:
+
+```sql
+SELECT count(*), sum(length(value)) FROM cache_control;
+-- Or, in a separate prepared session:
+COPY (SELECT id, value FROM cache_control) TO STDOUT (FORMAT BINARY);
+```
+
+An untimed post-check returned exactly `100000|12800000`. EXPLAIN ANALYZE
+confirmed a serial 100,000-row scan with **2,048 local-buffer hits, zero
+local-buffer reads, and no temp writes** for each case. The temporary relation
+fits in the 32 MiB local buffer allocation; these are all-cache-hit controls,
+unlike the persistent-table benchmark's mostly missed shared buffers.
+
+| Fully cached workload | Native median, ms | Guest median, ms | Guest/native |
+|-----------------------|------------------:|-----------------:|-------------:|
+| Aggregate scan | 25.541 | 27.331 | 1.07x |
+| Binary COPY to client | 41.093 | 154.853 | 3.77x |
+
+These are nearest-rank medians of **four samples per case**, without
+independent server-start repeats or a reliable tail estimate. Aggregate ranges were
+25.086-27.322 ms native / 26.156-29.579 ms guest; COPY ranges were
+38.629-49.755 / 154.488-158.214 ms.
+
+**What this establishes:**
+
+- Scanning/computation can run near native speed when the data is already
+  inside PostgreSQL's buffers. The persistent-table guest aggregate took
+  73.941 ms, versus 27.331 ms in this cache-hit control.
+- Returning all rows is substantially slower even without data-file
+  reads during the scan: cached guest COPY took 154.853 ms, versus
+  41.093 ms native. Removing storage access does not remove the return-path
+  gap.
+- The inspected persistent hostfs path performs a host call and data copying
+  for reads; its stateless backend reopens, seeks, reads, and closes files
+  per request. Guest socket sends/polls also cross host-call boundaries.
+  Those paths add more than PostgreSQL's own scanning work.
+
+**What it does not establish:** an exact percentage attributable to VM
+exit/reentry, marshalling, copying, host filesystem/socket work, or scheduling.
+Local temporary buffers and regular shared buffers are different execution
+paths; subtracting these timings is not a controlled decomposition of
+overhead. The filesystem profile above also excludes transition time and
+does not profile this control directly. Nested virtualization may contribute,
+but its contribution was not isolated.
+
+Raw SQL scripts, timings, checks, EXPLAIN JSON, and
+`results.json` are preserved under
+`target/postgres-experiment/read-benchmark/cache-control-20261110T064541.494751Z/`.
+No server was left running; session-local tables were dropped on disconnect.
+
+### Read-test resource use
+
+Peak sampled server-tree PSS was **30,373 KiB native / 115,875 KiB guest**.
+Guest audited storage high-water was **75,814,368 bytes**. An observer
+connection collects untimed counters/validation beside the one-client
+benchmark, within the two-connection cap. Servers run serially with the
+512 MiB scratch/storage and 1 GiB sampled-memory limits. Each scan
+has a 30-second SQL deadline, client 90 seconds, and guest VM 120 seconds.
+
+## Reproducibility and validation
+
+With initialized storage, build and run [the documented targets](README.md#performance):
+
+```sh
+make -C samples/postgres pg-guest storage-build storage-package recovery-test
+make -C samples/postgres benchmark-build check benchmark read-benchmark
+```
+
+Successful current evidence is ignored under:
+
+- SQL/spill/profile: `target/postgres-experiment/phase5/20261110T063425.151132Z/`.
+- Standard-client reads: `target/postgres-experiment/read-benchmark/20261110T063541.385661Z/`.
+
+The run directories contain raw latencies, standard-tool logs/SQL, EXPLAIN,
+resource/buffer measurements, output hashes, and versioned results.
+Top-level result files point to these release runs.
+
+Validation passed: **40 Python tests**, all nine native and nine KVM process
+probes, concurrent SQL/authentication/24 reconnects, persistent storage errors/
+pagination/single-writer checks, fresh-VM recovery/WAL failures, seven targeted
+Rust tests **in release mode**, six SQL/spill runs plus profiling, and all
+72 read scans with 18 exact export hashes. No server or ownership lock is
+deliberately left running/held.
+
+These are instrumented release comparisons on one nested, shared Azure VM,
+not universal performance guarantees. Recovery covers owned-host SIGKILL and
+WAL write/sync EIO/EDQUOT with host page cache intact. A failed sync can leave
+an unacknowledged transaction recoverable, so its outcome is unknown. Physical
+power loss, arbitrary torn writes, complete POSIX descriptors/locking,
+snapshots, replication, SMP, and production readiness remain unproven.

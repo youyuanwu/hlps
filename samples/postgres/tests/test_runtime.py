@@ -10,6 +10,19 @@ SPEC.loader.exec_module(runtime)
 
 
 class ResultTests(unittest.TestCase):
+    def test_cargo_build_settings_enforce_release_even_with_environment_overrides(self):
+        with patch.dict(runtime.os.environ, {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
+                                            "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS": "true",
+                                            "CARGO_BUILD_JOBS": "8"}):
+            env = runtime.cargo_env()
+            self.assertEqual(runtime.RUST_BUILD["profile"], "release")
+            self.assertEqual(env["CARGO_PROFILE_RELEASE_OPT_LEVEL"], "3")
+            self.assertEqual(env["CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS"], "false")
+            self.assertEqual(env["CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS"], "false")
+            self.assertEqual(env["CARGO_PROFILE_RELEASE_DEBUG"], "0")
+            self.assertEqual(env["CARGO_PROFILE_RELEASE_INCREMENTAL"], "false")
+            self.assertEqual(env["CARGO_BUILD_JOBS"], "1")
+
     def test_exact_success(self):
         runtime.validate_result("spawn", "diagnostic\nPASS spawn\n", 0)
 

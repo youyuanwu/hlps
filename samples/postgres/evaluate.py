@@ -314,17 +314,20 @@ def environment(server_cpu, client_cpu):
         "load_average": list(os.getloadavg()),
         "meminfo": Path("/proc/meminfo").read_text(),
         "cache_conditions": "fresh server processes; host caches retained; fixture/EXPLAIN/checkpoint preparation and per-workload warmup",
-        "compiler_profile": "PG/client -O2 -march=x86-64; guest assertions on, native off; Rust host dev, debug=0, opt-level=0",
+        "compiler_profile": "PG/client -O2 -march=x86-64; assertions disabled in both PG builds; "
+                            "Rust host release, opt-level=3, debug=0, debug/overflow checks disabled",
+        "rust_build": json.loads((storage.DATA / "build.json").read_text())["rust_build"],
+        "postgres_builds": {"native": postgres.build_settings(False), "guest": postgres.build_settings(True)},
+        "instrumentation": "hostfs mutation audit and quota accounting retained; profiler disabled for timed runs "
+                           "and enabled only in the separate diagnostic; native has no hostfs audit",
         "sources": runtime.pins(),
     }
 
 
-def verify():
+def verify_server():
     storage.verify()
     postgres.verify_postgres_install(False)
-    build_meta = json.loads((DATA / "build.json").read_text())
-    if build_meta["inputs"] != client_inputs() or build_meta["client_sha256"] != runtime.digest(CLIENT):
-        raise RuntimeError("evaluation client changed; run benchmark-build")
+    postgres.verify_postgres_install(True)
     gate = json.loads((recovery.DATA / "results.json").read_text())
     expected = {
         "phase4_sha256": runtime.digest(runtime.HERE / "recovery.py"),
@@ -343,6 +346,14 @@ def verify():
             raise RuntimeError("persistent configuration changed; run storage-config and recovery-test")
     if recovery.FAULT.exists() or recovery.FAULT.with_suffix(".new").exists():
         raise RuntimeError("leftover WAL fault controls; inspect before evaluation")
+    return expected
+
+
+def verify():
+    expected = verify_server()
+    build_meta = json.loads((DATA / "build.json").read_text())
+    if build_meta["inputs"] != client_inputs() or build_meta["client_sha256"] != runtime.digest(CLIENT):
+        raise RuntimeError("evaluation client changed; run benchmark-build")
     return expected
 
 
