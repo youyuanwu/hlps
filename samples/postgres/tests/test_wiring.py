@@ -7,6 +7,7 @@ from unittest.mock import patch
 import evaluate
 import postgres
 import recovery
+import read_benchmark
 import runtime
 import storage
 
@@ -22,7 +23,7 @@ class WiringTests(unittest.TestCase):
                 self.assertEqual(scripts, expected)
 
     def test_all_validation_commands_load(self):
-        for module in (runtime, postgres, storage, recovery, evaluate):
+        for module in (runtime, postgres, storage, recovery, evaluate, read_benchmark):
             with self.subTest(command=module.__name__):
                 result = subprocess.run([sys.executable, "-B", module.__file__, "--help"],
                                         capture_output=True, text=True, timeout=5)

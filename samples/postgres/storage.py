@@ -54,15 +54,17 @@ def build():
     runtime.build(HERE / "rootfs/kernel.conf", DATA)
     source = runtime.UPSTREAM / "examples/postgres_storage.rs"
     shutil.copy2(HERE / "storage-host.rs", source)
-    env = dict(os.environ, CARGO_BUILD_JOBS="1",
-               CARGO_TARGET_DIR=str(WORK / "cargo"), CARGO_PROFILE_DEV_DEBUG="0")
-    runtime.run(["cargo", "build", "--locked", "--example", "postgres_storage"],
+    env = runtime.cargo_env()
+    runtime.run(["cargo", "build", "--release", "--locked", "--example", "postgres_storage"],
                cwd=runtime.UPSTREAM, env=env)
-    shutil.copy2(WORK / "cargo/debug/examples/postgres_storage", DATA / "storage-host")
-    runtime.run(["cargo", "test", "--locked", "--lib", "hostfs::tests"], cwd=runtime.UPSTREAM, env=env)
-    runtime.run(["cargo", "test", "--locked", "--example", "postgres_storage"], cwd=runtime.UPSTREAM, env=env)
+    shutil.copy2(WORK / "cargo/release/examples/postgres_storage", DATA / "storage-host")
+    runtime.run(["cargo", "test", "--release", "--locked", "--lib", "hostfs::tests"],
+                cwd=runtime.UPSTREAM, env=env)
+    runtime.run(["cargo", "test", "--release", "--locked", "--example", "postgres_storage"],
+                cwd=runtime.UPSTREAM, env=env)
     runtime.write_json(DATA / "host.json", {
-        "inputs": inputs(), "host_sha256": runtime.digest(DATA / "storage-host"),
+        "inputs": inputs(), "rust_build": runtime.RUST_BUILD,
+        "host_sha256": runtime.digest(DATA / "storage-host"),
         "kernel_sha256": runtime.digest(DATA / "kernel-build/elfloader_hyperlight-x86_64"),
     })
 
@@ -71,6 +73,8 @@ def package():
     host = json.loads((DATA / "host.json").read_text())
     if host["inputs"] != inputs():
         raise RuntimeError("storage build inputs changed; run storage-build")
+    if host.get("rust_build") != runtime.RUST_BUILD:
+        raise RuntimeError("Storage host must use the verified release build; run storage-build")
     postgres.prepare_sources()
     postgres.verify_postgres_install(False)
     postgres.verify_postgres_install(True)
@@ -100,7 +104,7 @@ def package():
                        cwd=ROOTFS, input=("\n".join(names) + "\n").encode(),
                        stdout=archive, check=True)
     runtime.write_json(DATA / "build.json", {
-        "inputs": inputs(), "host_sha256": host["host_sha256"],
+        "inputs": inputs(), "rust_build": host["rust_build"], "host_sha256": host["host_sha256"],
         "kernel_sha256": host["kernel_sha256"],
         "rootfs_sha256": runtime.digest(DATA / "postgres.cpio"),
         "postgres_sha256": runtime.digest(ROOTFS / "usr/local/bin/postgres"),
@@ -173,6 +177,8 @@ def verify():
     meta = json.loads((DATA / "build.json").read_text())
     if meta["inputs"] != inputs():
         raise RuntimeError("Storage build inputs changed; rebuild/repackage")
+    if meta.get("rust_build") != runtime.RUST_BUILD:
+        raise RuntimeError("Storage host must use the verified release build; rebuild/repackage")
     for field, path in (("host_sha256", DATA / "storage-host"),
                         ("kernel_sha256", DATA / "kernel-build/elfloader_hyperlight-x86_64"),
                         ("rootfs_sha256", DATA / "postgres.cpio"),

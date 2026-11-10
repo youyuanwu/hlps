@@ -19,6 +19,7 @@ PostgreSQL.
 | Fresh-VM recovery | Sixteen acknowledged commits survive restart and owned-host SIGKILL; stale DSM addresses are not attached |
 | Failure handling | SQL-time WAL write/sync EIO and EDQUOT fail without a commit acknowledgement |
 | Measurements | Six serial native/guest runs plus a separate filesystem profile, with exact results and resource bounds |
+| Full-table reads | pgbench SELECT/aggregate scans and psql binary COPY; independent full-output verification outside timing |
 
 This is a working, bounded sample, **not a production PostgreSQL port or a
 power-loss durability certification**. A sync error can leave an unacknowledged
@@ -80,8 +81,7 @@ changed.
 
 ## Validation commands
 
-The suites are organized by what they validate, not by an implementation
-sequence. With initialized persistent storage, run everything serially:
+With initialized persistent storage, run all validation suites serially:
 
 ```sh
 make -C samples/postgres validate
@@ -99,6 +99,7 @@ Or select a capability:
 | `recovery-test` | Native/guest spill correctness, graceful restart, crash recovery, lifecycle, and WAL faults |
 | `benchmark-build` | Compile the bounded native libpq timing client |
 | `benchmark` | Three rotating native/guest repeats and a separate guest filesystem profile |
+| `read-benchmark` | Standard pgbench/psql full-table reads, with fresh-server/repeated scans and separate output verification |
 
 The RAM demo explicitly uses `fsync=off`: its database is a fresh RAM copy and
 SQL changes disappear on exit. It is not a fallback for persistent/recovery
@@ -136,7 +137,7 @@ touching, and 32 cross-process semaphore rounds.
 and the guest server from a separately patched tree. Its SQL suite rejects
 wrong credentials, requires distinct simultaneous backends and the necessary
 auxiliary processes, verifies transactions/dirty-read refusal and independent
-settings/temp tables, and checks reconnect RSS growth against the unchanged
+settings/temp tables, and checks reconnect RSS growth against the
 32 MiB limit.
 
 [init.c](rootfs/init.c) is a Linux PIE supervisor: it checks guest ownership and
@@ -147,7 +148,7 @@ VM identity. It does not rely on the pinned CLI's blocking stdin callback.
 ### Filesystem and recovery
 
 [storage.py](storage.py), [storage-host.rs](storage-host.rs), and
-[storage.c](tests/storage.c) retain the observed, quota-limited host backend.
+[storage.c](tests/storage.c) implement the observed, quota-limited host backend.
 Successful audit entries follow actual OS synchronization, not stubbed success.
 File/directory/synchronous-write errors, partial-write EIO, EDQUOT, and EROFS
 are propagated. Unsupported hostfs record locks/flock and mount-wide sync fail
@@ -173,26 +174,118 @@ allowed to be unknown rather than misreported as rollback.
 
 ### Performance
 
-[evaluate.py](evaluate.py) and [query-client.c](tests/query-client.c) retain
+[runtime.py](runtime.py) and [storage.py](storage.py) build Rust hosts with
+`cargo --release`: optimization level 3, no debug information, debug assertions,
+overflow checks, or incremental compilation. The pinned kernel uses a
+performance-optimized configuration. Native and guest PostgreSQL both use
+`-O2 -march=x86-64` with PostgreSQL assertions disabled; native sources are
+unmodified. Header-generation prerequisites are explicit for clean builds
+invoked through the sample Makefile.
+
+Artifact metadata fingerprints these settings. Packaging/measurement refuses
+host metadata that does not match the release policy, stale binaries, or
+PostgreSQL assertions enabled in either build. Benchmark metadata records the actual
+verified host profile and both PostgreSQL configure/header identities, rather
+than inferring optimization from a filename.
+
+The hostfs mutation audit, quota checks, ownership guards, and real file/WAL
+synchronization are enabled. The native server has no equivalent hostfs
+audit, so these compare complete instrumented stacks, not isolated
+virtualization overhead. Profiling is off in measured runs and on only in the
+separate diagnostic. Disabling assertions in server builds does not disable
+the sample's correctness checks or test assertions.
+
+[evaluate.py](evaluate.py) and [query-client.c](tests/query-client.c) implement
 the compiled libpq measurement path. Each mode runs three times in rotating
 order, with 1,000 selects, 1,000 indexed lookups, 300 synchronous updates, and
-five spill checksums per repeat, after the existing warm-ups.
+five spill checksums per repeat, after untimed warm-ups.
 
 Servers inherit one logical CPU and clients/samplers another; affinity is
 verified and restored. Timed `PQexec` round trips exclude result validation
 and CSV output. Separate batch timing measures single-client closed-loop
-throughput. Main runs retain storage auditing but disable the profiler; a
+throughput. Main runs enable storage auditing and disable the profiler; a
 reduced diagnostic records filesystem callback counts/body time separately.
 See [RESULTS.md](RESULTS.md) for all measured values and caveats.
 
+### Full-table read throughput
+
+To compare reading actual rows out of the native and guest databases:
+
+```sh
+# After setup, or whenever the Makefile/build inputs have changed:
+make -C samples/postgres pg-guest storage-build storage-package recovery-test
+make -C samples/postgres check read-benchmark
+# Repeat against the same verified builds:
+make -C samples/postgres read-benchmark
+```
+
+[read_benchmark.py](read_benchmark.py) reuses the same 100,000-row fixture,
+CPU pinning, credentials, guarded launchers, and resource limits. Preparation
+recreates only `spill_fixture` and `eval_commits` in the dedicated databases,
+verifies the exact checksum, checkpoints, and stops both servers.
+The benchmark requires the current successful recovery gate and the native
+`psql`/`pgbench` 16.15 clients built by `pg-native`; no new client binary is built.
+
+Each mode/workload/repeat boots a separate server, then runs:
+
+- `SELECT id,value FROM spill_fixture`, using a custom SQL script in standard
+  `pgbench -n -c 1 -j 1 -M simple -t 4 -l`. It consumes the full results without
+  printing rows; no pgbench-specific tables or initialization are needed.
+- Binary `COPY (SELECT id,value FROM spill_fixture) TO STDOUT`, using standard
+  `psql` with `\timing` and `\o /dev/null`.
+- `SELECT count(*),sum(length(value)) FROM spill_fixture`, returning two
+  scalars through pgbench as a scan/computation control, not a bulk-transfer test.
+
+Each client runs one first scan and three immediately repeated scans on the
+same connection. Three rotating serial native/guest repeats produce three
+fresh-server and nine repeated samples per mode/workload. `LC_ALL=C` makes
+standard-tool output parsing deterministic, and nonzero exits, failed
+transactions, or missing/extra latency samples fail the test.
+
+Timing comes directly from pgbench's per-transaction logs and psql's COPY
+timings: query/protocol/result-consumption cost is included, connection/startup
+and correctness checks are excluded. First-row latency is not reported.
+pgbench/libpq can buffer a full query result; psql streams COPY output.
+
+Throughput uses 13,200,000 logical payload bytes per transfer: a four-byte ID
+and 128-byte value per row. It is not full TCP/protocol wire bandwidth.
+The aggregate has no bulk-payload throughput. pgbench does not check every
+returned row: **correctness is verified separately**, after all timed scans.
+Each run checks the exact aggregate and uses untimed psql binary COPY ordered
+by ID to compare all 14,200,021 output bytes against an independently computed
+SHA-256 expectation. The temporary verification file is deleted after success.
+
+Heap read/hit deltas are recorded outside timing for the four timed scans
+combined, before untimed correctness and EXPLAIN checks. Each group measured
+8,000 read blocks / 192 hits, with subsequent plans requiring a serial
+100,000-row Seq Scan and no sorting/temp writes. **Repeated does not mean
+fully resident in shared buffers.** The host page cache is retained throughout;
+these are not cold-disk or raw storage bandwidth measurements.
+
+The [read results](RESULTS.md#full-table-read-throughput-2026-11-10) show about
+68 MB/s guest SELECT payload and 64 MB/s COPY, versus roughly 309-311 MB/s
+native in the release-build run.
+Raw pgbench transaction logs, psql timing output, SQL scripts, EXPLAIN plans,
+tool hashes, output-validation hashes, and resource measurements stay ignored
+under `target/postgres-experiment/read-benchmark/`. The full `validate` target
+also includes this suite. The small-query/spill benchmark uses its compiled
+timing client; the read-throughput suite uses standard PostgreSQL clients.
+Both use the release build policy.
+
+A separate [cache-hit diagnostic](RESULTS.md#cache-hit-control-separating-storage-and-result-delivery)
+shows near-native aggregate scans when the same rows are fully buffered
+(25.5 ms native / 27.3 ms guest), while binary COPY takes
+(41.1 / 154.9 ms). This supports investigating both host-backed reads and
+result delivery, not blaming PostgreSQL computation alone. It does not isolate
+the cost of hypercall transitions from copying, marshalling, host operations,
+or scheduling; see the diagnostic's method and four-sample limitations.
+
 ## Data, configuration, and ownership
 
-Everything generated remains ignored beneath `target/postgres-experiment/`:
+Everything generated is ignored beneath `target/postgres-experiment/`:
 sources, builds, CPIOs, logs/audits, passwords, result metadata, and databases.
-Existing internal directory names, configuration markers, result formats, and
-the `phase2` test database role are preserved so saved data and measurements
-need no migration. The maintained entry points are the descriptive commands
-above.
+PostgreSQL clients authenticate as the `phase2` test database role. Use the
+targets above to build and validate the sample.
 
 The persistent directory is [storage.STORAGE](storage.py); its PGDATA is
 mounted at `/storage/pgdata`. Application/kernel files remain RAM-backed, and
@@ -224,11 +317,10 @@ upstream notices and document their provenance:
 [Hyperlight-Unikraft](patches/hyperlight-unikraft/README.md).
 No source fork or PostgreSQL submodule is required.
 
-Builds use one job and explicit GNU C17/baseline `-march=x86-64`, avoiding the
-tested GCC C23 constructor and distro x86-64-v3 boot failures. Input stamps
-invalidate stale objects. The rebuilt kernel is embedded before its CLI/host
-is compiled; frozen RAM/persistent executables remain valid when another
-runtime profile is built. Unexpected source edits or changed prepared patch
+Builds use one job and explicit GNU C17/baseline `-march=x86-64`. Input stamps
+invalidate stale objects. Each CLI/host embeds its source-built kernel;
+building another runtime profile does not modify packaged RAM/persistent
+executables. Unexpected source edits or changed prepared patch
 stacks are rejected, never discarded or reset.
 
 The configuration keeps 512 MiB guest scratch, a 512 MiB logical storage

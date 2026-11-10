@@ -10,6 +10,21 @@ import storage
 
 
 class StorageTests(unittest.TestCase):
+    def test_release_metadata_is_required_before_packaging_or_running(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(storage, "DATA", Path(temporary)), \
+                patch.object(storage, "inputs", return_value={}), \
+                patch.object(storage.runtime, "verify_upstream"), \
+                patch.object(storage.runtime, "prepare_patches"), \
+                patch.object(storage.postgres, "prepare_sources"):
+            for filename, check in (("host.json", storage.package), ("build.json", storage.verify)):
+                for settings in ({}, dict(storage.runtime.RUST_BUILD, profile="dev"),
+                                 dict(storage.runtime.RUST_BUILD, opt_level=0)):
+                    (Path(temporary) / filename).write_text(
+                        json.dumps({"inputs": {}, "rust_build": settings}))
+                    with self.assertRaisesRegex(RuntimeError, "release build"):
+                        check()
+
     def test_writer_lock_rejects_aliases_and_is_released(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

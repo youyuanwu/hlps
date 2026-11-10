@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import selectors
 import shutil
@@ -75,7 +76,7 @@ def configure_args(guest):
     args = [source / "configure", f"--prefix={prefix}", *FLAGS, f"CFLAGS={cflags}"]
     if guest:
         args.extend(["CC=musl-gcc", "CPPFLAGS=-DEXEC_BACKEND -DHYPERLIGHT_UNIKRAFT",
-                     "--disable-rpath", "--enable-cassert", "--enable-depend"])
+                     "--disable-rpath", "--disable-cassert", "--enable-depend"])
     return args
 
 
@@ -96,6 +97,16 @@ def verify_postgres_install(guest):
     installed = (DATA / "guest-install/usr/local/bin/postgres") if guest else NATIVE / "bin/postgres"
     if runtime.digest(directory / "src/backend/postgres") != runtime.digest(installed):
         raise RuntimeError("Installed PostgreSQL does not match the verified build")
+    config = (directory / "src/include/pg_config.h").read_text()
+    if re.search(r"^\s*#\s*define\s+USE_ASSERT_CHECKING\b", config, re.MULTILINE):
+        raise RuntimeError("Comparison PostgreSQL builds must have assertions disabled")
+
+
+def build_settings(guest):
+    verify_postgres_install(guest)
+    directory = WORK / ("postgres-guest-build" if guest else "postgres-native-build")
+    return {"configure": json.loads((directory / "experiment-inputs.json").read_text())["configure"],
+            "assertions": False, "pg_config_sha256": runtime.digest(directory / "src/include/pg_config.h")}
 
 
 def build_postgres(guest):
@@ -116,6 +127,7 @@ def build_postgres(guest):
             runtime.run(args, cwd=directory)
     else:
         runtime.run(args, cwd=directory)
+    runtime.run(["make", "-j1", "-C", "src/backend", "generated-headers"], cwd=directory)
     if guest:
         install = DATA / "guest-install"
         install.mkdir(exist_ok=True)

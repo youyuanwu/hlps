@@ -21,6 +21,15 @@ CASES = ("hello", "spawn", "pipes", "signals", "blocked-signals", "setsid",
          "tls", "stack", "shared")
 PATCH_TARGETS = {"hyperlight-unikraft": ".", "unikraft": "kernel/unikraft",
                  "app-elfloader": "kernel/app-elfloader"}
+RUST_BUILD = {"profile": "release", "opt_level": 3, "debug": 0, "debug_assertions": False,
+              "overflow_checks": False, "incremental": False}
+
+
+def cargo_env():
+    env = dict(os.environ, CARGO_BUILD_JOBS="1", CARGO_TARGET_DIR=str(WORK / "cargo"))
+    env.update({f"CARGO_PROFILE_RELEASE_{key.upper()}": str(value).lower()
+                for key, value in RUST_BUILD.items() if key != "profile"})
+    return env
 
 
 def run(args, *, cwd=HERE, capture=False, env=None):
@@ -241,17 +250,16 @@ def build(overlay=None, output=WORK):
     embedded = kernel / "elfloader_hyperlight-x86_64"
     if digest(rebuilt) != digest(embedded):
         shutil.copyfile(rebuilt, embedded)
-    env = dict(os.environ, CARGO_BUILD_JOBS="1",
-               CARGO_TARGET_DIR=str(WORK / "cargo"), CARGO_PROFILE_DEV_DEBUG="0")
-    run(["cargo", "build", "--locked", "--bin", "hluk"], cwd=UPSTREAM, env=env)
-    cli = WORK / "cargo/debug/hluk"
+    env = cargo_env()
+    run(["cargo", "build", "--release", "--locked", "--bin", "hluk"], cwd=UPSTREAM, env=env)
+    cli = WORK / "cargo/release/hluk"
     if overlay is not None:
         shutil.copy2(cli, output / "hluk")
         cli = output / "hluk"
     compile_probe()
     metadata = {"sources": pins(), "submodules": verify_upstream(), "inputs": build_inputs(),
                 "kernel_sha256": digest(rebuilt), "embedded_kernel_sha256": digest(embedded),
-                "cli_sha256": digest(cli),
+                "cli_sha256": digest(cli), "rust_build": RUST_BUILD,
                 "rootfs_sha256": digest(WORK / "phase1.cpio"),
                 "config_sha256": digest(app / ".config"),
                 "kernel_cflags": "-std=gnu17 -march=x86-64", "build_jobs": 1,
@@ -309,9 +317,11 @@ def test(guest):
         metadata = json.loads((WORK / "build.json").read_text())
         if metadata["inputs"] != build_inputs():
             raise RuntimeError("Build inputs changed; run make runtime-build before guest tests")
+        if metadata.get("rust_build") != RUST_BUILD:
+            raise RuntimeError("Runtime must use the verified release build; run runtime-build")
         for key, path in (("kernel_sha256", WORK / "kernel-build/elfloader_hyperlight-x86_64"),
                           ("embedded_kernel_sha256", UPSTREAM / "kernel/elfloader_hyperlight-x86_64"),
-                          ("cli_sha256", WORK / "cargo/debug/hluk"),
+                          ("cli_sha256", WORK / "cargo/release/hluk"),
                           ("rootfs_sha256", WORK / "phase1.cpio")):
             if digest(path) != metadata[key]:
                 raise RuntimeError(f"Artifact changed since build: {path}")
@@ -320,7 +330,7 @@ def test(guest):
     results = []
     for case in CASES:
         if guest:
-            args = [WORK / "cargo/debug/hluk", "run", "--cold", "--scratch-mb", "512",
+            args = [WORK / "cargo/release/hluk", "run", "--cold", "--scratch-mb", "512",
                     "--initrd", WORK / "phase1.cpio", "--entry", "/phase1",
                     "--env", f"PHASE1_CASE={case}", "--env", "PHASE1_SHARED_VM=1"]
         else:
